@@ -1,0 +1,33 @@
+# OS/editor noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Rust build output
+/target/
+**/target/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Large local datasets and generated artifacts
+/datasets/*
+!/datasets/.gitkeep
+/fixtures/*
+!/fixtures/.gitkeep
+/reports/*
+!/reports/.gitkeep
+
+# Local storage paths
+/data/
+*.db/
+*.rocksdb/
+*.toplingdb/
+
+# Logs
+*.log
+*.tmp

@@ -1,0 +1,32 @@
+network: mainnet
+
+aptos:
+  indexer_grpc_data_service_address: "https://grpc.mainnet.aptoslabs.com:443"
+  auth_token: "${APTOS_GRPC_AUTH_TOKEN}"
+  starting_version: 4365621793
+  ending_version: null
+
+decibel:
+  package_address: "0x50ead22afd6ffd9769e3b3d6e0e64a2a350d68e8b102c4e72e33d0b8cfdfdb06"
+  orderbook_address: "0x50ead22afd6ffd9769e3b3d6e0e64a2a350d68e8b102c4e72e33d0b8cfdfdb06"
+
+dataset:
+  id: "mainnet_decibel_v4365621793"
+  root: "./datasets/mainnet_decibel_v4365621793"
+  raw_format: "protobuf-zstd"
+  normalized_format: "ndjson-zstd"
+  raw_chunk_versions: 1000000
+
+storage:
+  engine: "rocksdb"
+  path: "./data/decibel-hotindex-mainnet"
+
+api:
+  bind: "127.0.0.1:8080"
+  max_limit: 500
+
+bench:
+  warmup_seconds: 30
+  duration_seconds: 180
+  concurrency: 32
+  report_path: "./reports/bench-mainnet.json"

@@ -1,0 +1,11 @@
+[package]
+name = "decibel-hotindex-ingest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+decibel-hotindex-core = { path = "../decibel-hotindex-core" }
+decibel-hotindex-storage = { path = "../decibel-hotindex-storage" }
+serde_json = "1"

@@ -1,0 +1,32 @@
+network: testnet
+
+aptos:
+  indexer_grpc_data_service_address: "https://grpc.testnet.aptoslabs.com:443"
+  auth_token: "${APTOS_GRPC_AUTH_TOKEN}"
+  starting_version: 8106081556
+  ending_version: null
+
+decibel:
+  package_address: "0xe7da2794b1d8af76532ed95f38bfdf1136abfd8ea3a240189971988a83101b7f"
+  orderbook_address: "0xe7da2794b1d8af76532ed95f38bfdf1136abfd8ea3a240189971988a83101b7f"
+
+dataset:
+  id: "testnet_decibel_v8106081556"
+  root: "./datasets/testnet_decibel_v8106081556"
+  raw_format: "protobuf-zstd"
+  normalized_format: "ndjson-zstd"
+  raw_chunk_versions: 1000000
+
+storage:
+  engine: "rocksdb"
+  path: "./data/decibel-hotindex-testnet"
+
+api:
+  bind: "127.0.0.1:8080"
+  max_limit: 500
+
+bench:
+  warmup_seconds: 30
+  duration_seconds: 180
+  concurrency: 32
+  report_path: "./reports/bench-testnet.json"

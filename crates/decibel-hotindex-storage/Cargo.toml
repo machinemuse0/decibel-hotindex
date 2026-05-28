@@ -1,0 +1,17 @@
+[package]
+name = "decibel-hotindex-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+decibel-hotindex-core = { path = "../decibel-hotindex-core" }
+rocksdb = { version = "0.24.0", optional = true, default-features = false, features = ["lz4"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+default = []
+rocksdb = ["dep:rocksdb"]
+toplingsdb = ["rocksdb"]
