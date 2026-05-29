@@ -320,6 +320,9 @@ fn record_command(args: &[String]) -> Result<()> {
                 .optional_u64("--max-message-mb")?
                 .unwrap_or(128)
                 .saturating_mul(1024 * 1024) as usize,
+            key_sample_limit: opts
+                .optional_u64("--key-sample-limit")?
+                .unwrap_or(1_000_000),
             out_dir: out_dir.clone(),
             raw_format: raw_format.to_string(),
             package_address,
@@ -356,6 +359,7 @@ struct LiveRecordRequest {
     end_version: u64,
     batch_size: u64,
     max_decoding_message_size: usize,
+    key_sample_limit: u64,
     out_dir: PathBuf,
     raw_format: String,
     package_address: String,
@@ -415,6 +419,7 @@ async fn record_live_transaction_stream(request: LiveRecordRequest) -> Result<()
         request.start_version, request.end_version
     ));
     let mut writer = TransactionChunkWriter::create(&tmp_path)?;
+    let mut key_writer = RecordKeyWriter::create(&request, expected_count)?;
     let mut stream = client
         .get_transactions(grpc_request)
         .await
@@ -433,6 +438,7 @@ async fn record_live_transaction_stream(request: LiveRecordRequest) -> Result<()
         for transaction in response.transactions {
             last_version = Some(transaction.version);
             writer.write_transaction(&transaction)?;
+            key_writer.write_version(transaction.version, count)?;
             count += 1;
         }
     }
@@ -450,6 +456,7 @@ async fn record_live_transaction_stream(request: LiveRecordRequest) -> Result<()
     ));
     fs::rename(&tmp_path, &final_path)?;
     let chunk_sha256 = sha256_file(&final_path)?;
+    let key_report = key_writer.finish(&request, last_success_version)?;
     let chunk_name = final_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -475,7 +482,8 @@ async fn record_live_transaction_stream(request: LiveRecordRequest) -> Result<()
             "last_version": last_success_version,
             "transaction_count": count,
             "sha256": chunk_sha256
-        }]
+        }],
+        "key_files": key_report
     });
     write_json_pretty(&request.out_dir.join("record_checkpoint.json"), &checkpoint)?;
     println!(
@@ -531,6 +539,159 @@ impl TransactionChunkWriter {
         file.sync_all()?;
         Ok(())
     }
+}
+
+struct RecordKeyWriter {
+    tx_versions_tmp: PathBuf,
+    tx_versions_final: PathBuf,
+    tx_versions: BufWriter<File>,
+    sampled_versions: Vec<u64>,
+    sample_stride: u64,
+    sample_limit: u64,
+}
+
+impl RecordKeyWriter {
+    fn create(request: &LiveRecordRequest, expected_count: u64) -> Result<Self> {
+        let keys_dir = request.out_dir.join("keys");
+        fs::create_dir_all(&keys_dir)?;
+        let tx_versions_final = keys_dir.join(format!(
+            "tx_versions_{}_{}.u64be",
+            request.start_version, request.end_version
+        ));
+        let tx_versions_tmp = tx_versions_final.with_extension("u64be.tmp");
+        let tx_versions = BufWriter::new(File::create(&tx_versions_tmp)?);
+        let sample_limit = request.key_sample_limit.max(1);
+        let sample_stride = expected_count.div_ceil(sample_limit).max(1);
+        Ok(Self {
+            tx_versions_tmp,
+            tx_versions_final,
+            tx_versions,
+            sampled_versions: Vec::new(),
+            sample_stride,
+            sample_limit,
+        })
+    }
+
+    fn write_version(&mut self, version: u64, zero_based_idx: u64) -> Result<()> {
+        self.tx_versions.write_all(&version.to_be_bytes())?;
+        if zero_based_idx % self.sample_stride == 0
+            && self.sampled_versions.len() < self.sample_limit as usize
+        {
+            self.sampled_versions.push(version);
+        }
+        Ok(())
+    }
+
+    fn finish(
+        mut self,
+        request: &LiveRecordRequest,
+        last_success_version: u64,
+    ) -> Result<serde_json::Value> {
+        self.tx_versions.flush()?;
+        self.tx_versions.get_ref().sync_all()?;
+        drop(self.tx_versions);
+        fs::rename(&self.tx_versions_tmp, &self.tx_versions_final)?;
+
+        let dataset_root = dataset_root_for_raw_dir(&request.out_dir)?;
+        let queries_dir = dataset_root.join("queries");
+        fs::create_dir_all(&queries_dir)?;
+
+        let sample_file = request.out_dir.join("keys").join(format!(
+            "tx_versions_sample_{}_{}.ndjson",
+            request.start_version, last_success_version
+        ));
+        write_version_sample_file(&sample_file, &self.sampled_versions)?;
+
+        let point_file = queries_dir.join("point_tx_versions.ndjson");
+        write_point_tx_query_file(&point_file, &self.sampled_versions)?;
+
+        let multi_file = queries_dir.join("multi_get_tx_versions.ndjson");
+        write_multi_get_tx_query_file(&multi_file, &self.sampled_versions, 100)?;
+
+        let manifest_path = queries_dir.join("record_keys_manifest.json");
+        let key_manifest = serde_json::json!({
+            "source": "aptos_transaction_stream_record",
+            "start_version": request.start_version,
+            "last_success_version": last_success_version,
+            "tx_versions_file": artifact_key(&dataset_root, &self.tx_versions_final),
+            "tx_versions_sha256": sha256_file(&self.tx_versions_final)?,
+            "sample_stride": self.sample_stride,
+            "sample_limit": self.sample_limit,
+            "sample_count": self.sampled_versions.len(),
+            "sample_file": artifact_key(&dataset_root, &sample_file),
+            "sample_sha256": sha256_file(&sample_file)?,
+            "point_query_file": artifact_key(&dataset_root, &point_file),
+            "point_query_sha256": sha256_file(&point_file)?,
+            "multi_get_query_file": artifact_key(&dataset_root, &multi_file),
+            "multi_get_query_sha256": sha256_file(&multi_file)?,
+        });
+        write_json_pretty(&manifest_path, &key_manifest)?;
+        Ok(key_manifest)
+    }
+}
+
+fn write_version_sample_file(path: &Path, versions: &[u64]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+    for version in versions {
+        serde_json::to_writer(&mut writer, &serde_json::json!({ "version": version }))
+            .map_err(json_error)?;
+        writer.write_all(b"\n")?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_point_tx_query_file(path: &Path, versions: &[u64]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+    for version in versions {
+        let record = QueryCorpusRecord {
+            query_kind: QueryKind::GetTxByVersion,
+            tx_version: Some(*version),
+            tx_versions: Vec::new(),
+            market_id: None,
+            account: None,
+            builder_addr: None,
+            limit: None,
+        };
+        serde_json::to_writer(&mut writer, &record).map_err(json_error)?;
+        writer.write_all(b"\n")?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+fn write_multi_get_tx_query_file(path: &Path, versions: &[u64], batch_size: usize) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = File::create(path)?;
+    let mut writer = BufWriter::new(file);
+    for chunk in versions
+        .chunks(batch_size)
+        .filter(|chunk| !chunk.is_empty())
+    {
+        let record = QueryCorpusRecord {
+            query_kind: QueryKind::MultiGetTxVersions,
+            tx_version: None,
+            tx_versions: chunk.to_vec(),
+            market_id: None,
+            account: None,
+            builder_addr: None,
+            limit: None,
+        };
+        serde_json::to_writer(&mut writer, &record).map_err(json_error)?;
+        writer.write_all(b"\n")?;
+    }
+    writer.flush()?;
+    Ok(())
 }
 
 fn auth_token_present(opts: &Args<'_>) -> bool {
@@ -1277,6 +1438,19 @@ fn dataset_root_for_normalized_dir(normalized_dir: &Path) -> Result<PathBuf> {
     }
 }
 
+fn dataset_root_for_raw_dir(raw_dir: &Path) -> Result<PathBuf> {
+    if raw_dir.file_name().and_then(|name| name.to_str()) == Some("raw") {
+        raw_dir.parent().map(Path::to_path_buf).ok_or_else(|| {
+            HotIndexError::Config(format!(
+                "raw output {} has no dataset root parent",
+                raw_dir.display()
+            ))
+        })
+    } else {
+        Ok(raw_dir.to_path_buf())
+    }
+}
+
 struct Args<'a> {
     args: &'a [String],
 }
@@ -1403,7 +1577,7 @@ fn print_usage() {
   decibel-dataset replay --dataset <dataset-dir> [--engine memory]
   decibel-dataset normalize --input <raw> --out-dir <normalized-dir> [--format fixture-jsonl] [--config <config.yaml>]
   decibel-dataset inspect-raw --input <transactions.pb.zst> [--limit <n>]
-  decibel-dataset record --live --network mainnet --endpoint <url> [--auth-token <token>|--auth-token-env <env>] [--batch-size <n>] [--package-address <addr>] [--orderbook-address <addr>] --start-version <n> --end-version <n> --out-dir <raw-dir> --raw-format protobuf-zstd"
+  decibel-dataset record --live --network mainnet --endpoint <url> [--auth-token <token>|--auth-token-env <env>] [--batch-size <n>] [--key-sample-limit <n>] [--package-address <addr>] [--orderbook-address <addr>] --start-version <n> --end-version <n> --out-dir <raw-dir> --raw-format protobuf-zstd"
     );
 }
 

@@ -154,6 +154,45 @@ rtk cargo run -p decibel-dataset -- inspect-raw \
 
 Do not delete raw chunks after normalization. Raw chunks are the source of truth for RocksDB and ToplingDB replay.
 
+Example ~20 GiB archive, based on the observed local ratio `100k tx ~= 130 MiB`:
+
+```bash
+export START_VERSION=4365621793
+export END_VERSION=4381375638
+export DATASET_ROOT=/data/decibel-hotindex/datasets/mainnet-${START_VERSION}-${END_VERSION}
+mkdir -p "$DATASET_ROOT/raw"
+
+rtk cargo run -p decibel-dataset -- record \
+  --live \
+  --network mainnet \
+  --endpoint grpc.mainnet.aptoslabs.com:443 \
+  --auth-token-env APTOS_GRPC_AUTH_TOKEN \
+  --start-version "$START_VERSION" \
+  --end-version "$END_VERSION" \
+  --batch-size 500 \
+  --key-sample-limit 1000000 \
+  --out-dir "$DATASET_ROOT/raw" \
+  --raw-format protobuf-zstd
+```
+
+This range contains `15,753,846` transactions. At `130 MiB / 100k tx`, expected local compressed raw size is roughly `20 GiB`. The Geomi billable Transaction Stream size may differ from local `.pb.zst` size, so check dashboard usage after the first large run.
+
+The recorder also writes benchmark key artifacts while streaming:
+
+```text
+$DATASET_ROOT/raw/keys/tx_versions_<start>_<end>.u64be
+$DATASET_ROOT/raw/keys/tx_versions_sample_<start>_<end>.ndjson
+$DATASET_ROOT/queries/point_tx_versions.ndjson
+$DATASET_ROOT/queries/multi_get_tx_versions.ndjson
+$DATASET_ROOT/queries/record_keys_manifest.json
+```
+
+Notes:
+
+- `tx_versions_*.u64be` contains every recorded transaction version as big-endian `u64`; for 15.75M tx it is about 126 MiB.
+- query corpus files are sampled during record using `--key-sample-limit`.
+- Decibel market/account/builder query files still require protobuf normalization and event parsing.
+
 ## 6. RocksDB Baseline
 
 RocksDB is already wired. For fixture/synthetic datasets:
