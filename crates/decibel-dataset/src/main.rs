@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tonic::transport::{Channel, ClientTlsConfig};
@@ -52,6 +52,7 @@ const MAINNET_DECIBEL_ADDRESS: &str =
     "0x50ead22afd6ffd9769e3b3d6e0e64a2a350d68e8b102c4e72e33d0b8cfdfdb06";
 const TESTNET_DECIBEL_ADDRESS: &str =
     "0xe7da2794b1d8af76532ed95f38bfdf1136abfd8ea3a240189971988a83101b7f";
+const DEFAULT_RECORD_CHUNK_TRANSACTION_COUNT: u64 = 100_000;
 
 fn main() {
     if let Err(error) = run(env::args().skip(1).collect()) {
@@ -86,26 +87,35 @@ fn inspect_raw_command(args: &[String]) -> Result<()> {
     let opts = Args::new(args);
     let input = opts.required_path("--input")?;
     let limit = opts.optional_u64("--limit")?.unwrap_or(u64::MAX);
+    let allow_truncated = opts.has_flag("--allow-truncated");
     let mut decoder = zstd::stream::read::Decoder::new(File::open(&input)?)?;
-    let mut bytes = Vec::new();
-    decoder.read_to_end(&mut bytes)?;
-    let mut slice = bytes.as_slice();
     let mut count = 0_u64;
     let mut first_version = None;
     let mut last_version = None;
-    while !slice.is_empty() && count < limit {
-        let tx = Transaction::decode_length_delimited(&mut slice)
-            .map_err(|error| HotIndexError::Parse(error.to_string()))?;
-        first_version.get_or_insert(tx.version);
-        last_version = Some(tx.version);
-        count += 1;
+    let mut truncated_error = None;
+    while count < limit {
+        match read_next_len_delimited_transaction(&mut decoder) {
+            Ok(Some(tx)) => {
+                first_version.get_or_insert(tx.version);
+                last_version = Some(tx.version);
+                count += 1;
+            }
+            Ok(None) => break,
+            Err(error) if allow_truncated => {
+                truncated_error = Some(error.to_string());
+                break;
+            }
+            Err(error) => return Err(error),
+        }
     }
     let report = serde_json::json!({
         "input": input.display().to_string(),
         "decoded_transactions": count,
         "first_version": first_version,
         "last_version": last_version,
-        "remaining_bytes_after_limit": slice.len()
+        "next_start_version": last_version.and_then(|version| version.checked_add(1)),
+        "truncated_error": truncated_error,
+        "stopped_at_limit": count == limit
     });
     serde_json::to_writer_pretty(std::io::stdout(), &report).map_err(json_error)?;
     println!();
@@ -265,18 +275,30 @@ fn normalize_command(args: &[String]) -> Result<()> {
         .or_else(|| opts.optional_value("--raw-format"))
         .map(str::to_string)
         .unwrap_or_else(|| infer_raw_format(&input).to_string());
-    if raw_format != "fixture-jsonl" {
-        fs::create_dir_all(&out_dir)?;
-        let warning = format!(
-            "normalize skeleton only: raw Aptos protobuf decoding is pending; input={}\n",
-            input.display()
-        );
-        fs::write(out_dir.join("parse_warnings.log"), warning)?;
+    if raw_format == "protobuf-zstd" || raw_format == "aptos-transaction-protobuf-zstd" {
+        let dataset_root = dataset_root_for_normalized_dir(&out_dir)?;
+        let parser_options = parser_options_from_args(&opts, &dataset_root)?;
+        let raw_inputs = resolve_protobuf_raw_inputs(&input)?;
+        let raw_input_count = raw_inputs.len();
+        normalize_protobuf_tx_only(&dataset_root, &out_dir, &raw_inputs, &parser_options)?;
         println!(
-            "normalize skeleton wrote parse_warnings.log at {}",
-            out_dir.display()
+            "normalized Aptos protobuf tx-only dataset written at {} from {} raw chunk(s)",
+            out_dir.display(),
+            raw_input_count
         );
         return Ok(());
+    }
+
+    if raw_format != "fixture-jsonl" {
+        return Err(HotIndexError::Config(format!(
+            "unsupported normalize raw format: {raw_format}"
+        )));
+    }
+    if input.is_dir() {
+        return Err(HotIndexError::Config(format!(
+            "fixture-jsonl normalize requires a file input, got directory {}",
+            input.display()
+        )));
     }
 
     let dataset_root = dataset_root_for_normalized_dir(&out_dir)?;
@@ -295,9 +317,25 @@ fn record_command(args: &[String]) -> Result<()> {
     let config = load_optional_config(&opts)?;
     let network = resolve_network(&opts, config.as_ref())?;
     let endpoint = opts.optional_value("--endpoint").unwrap_or("");
-    let start_version = opts.optional_u64("--start-version")?.unwrap_or(0);
-    let end_version = opts.optional_u64("--end-version")?;
     let out_dir = opts.required_path("--out-dir")?;
+    let resume = opts.has_flag("--resume");
+    let resume_state = load_record_resume_state(&out_dir)?;
+    let requested_start_version = opts.optional_u64("--start-version")?;
+    let start_version =
+        resolve_record_start_version(requested_start_version, resume, &resume_state)?;
+    let requested_end_version = opts.optional_u64("--end-version")?;
+    let transactions_count = opts.optional_u64("--transactions-count")?;
+    let end_version =
+        resolve_record_end_version(start_version, requested_end_version, transactions_count)?;
+    let max_raw_bytes = opts.optional_bytes("--max-raw-bytes")?;
+    let record_chunk_transaction_count = opts
+        .optional_u64("--chunk-transaction-count")?
+        .unwrap_or(DEFAULT_RECORD_CHUNK_TRANSACTION_COUNT);
+    if record_chunk_transaction_count == 0 {
+        return Err(HotIndexError::Config(
+            "--chunk-transaction-count must be greater than zero".to_string(),
+        ));
+    }
     let raw_format = opts
         .optional_value("--raw-format")
         .unwrap_or("protobuf-zstd");
@@ -313,13 +351,21 @@ fn record_command(args: &[String]) -> Result<()> {
             endpoint: endpoint.to_string(),
             start_version,
             end_version: end_version.ok_or_else(|| {
-                HotIndexError::Config("--live record requires --end-version".to_string())
+                HotIndexError::Config(
+                    "--live record requires --end-version or --transactions-count".to_string(),
+                )
             })?,
+            requested_start_version,
+            requested_end_version,
+            transactions_count,
+            resume,
             batch_size: opts.optional_u64("--batch-size")?.unwrap_or(100).min(1000),
             max_decoding_message_size: opts
                 .optional_u64("--max-message-mb")?
                 .unwrap_or(128)
                 .saturating_mul(1024 * 1024) as usize,
+            max_raw_bytes,
+            chunk_transaction_count: record_chunk_transaction_count,
             key_sample_limit: opts
                 .optional_u64("--key-sample-limit")?
                 .unwrap_or(1_000_000),
@@ -328,12 +374,23 @@ fn record_command(args: &[String]) -> Result<()> {
             package_address,
             orderbook_address,
             auth_token: token,
+            previous_chunks: if resume {
+                resume_state.chunks.clone()
+            } else {
+                Vec::new()
+            },
         };
         let runtime = tokio::runtime::Runtime::new()
             .map_err(|error| HotIndexError::Config(error.to_string()))?;
         return runtime.block_on(record_live_transaction_stream(request));
     }
 
+    let resume_transaction_count = resume_state.chunks.iter().try_fold(0_u64, |acc, chunk| {
+        acc.checked_add(chunk_transaction_count(chunk))
+            .ok_or_else(|| {
+                HotIndexError::Config("checkpoint transaction count overflow".to_string())
+            })
+    })?;
     let checkpoint = serde_json::json!({
         "status": "planned",
         "message": "record skeleton only; Aptos gRPC recording is implemented in a later milestone",
@@ -343,9 +400,18 @@ fn record_command(args: &[String]) -> Result<()> {
         "orderbook_address": orderbook_address,
         "start_version": start_version,
         "end_version": end_version,
+        "requested_start_version": requested_start_version,
+        "requested_end_version": requested_end_version,
+        "transactions_count": transactions_count,
+        "resume": resume,
         "raw_format": raw_format,
         "auth_token_present": auth_token_present,
-        "last_success_version": null
+        "last_success_version": resume_state.last_success_version,
+        "next_start_version": resume_state.next_start_version.unwrap_or(start_version),
+        "max_raw_bytes": max_raw_bytes,
+        "chunk_transaction_count": record_chunk_transaction_count,
+        "transaction_count": resume_transaction_count,
+        "chunks": resume_state.chunks
     });
     write_json_pretty(&out_dir.join("record_checkpoint.json"), &checkpoint)?;
     println!("record skeleton wrote checkpoint at {}", out_dir.display());
@@ -357,14 +423,100 @@ struct LiveRecordRequest {
     endpoint: String,
     start_version: u64,
     end_version: u64,
+    requested_start_version: Option<u64>,
+    requested_end_version: Option<u64>,
+    transactions_count: Option<u64>,
+    resume: bool,
     batch_size: u64,
     max_decoding_message_size: usize,
+    max_raw_bytes: Option<u64>,
+    chunk_transaction_count: u64,
     key_sample_limit: u64,
     out_dir: PathBuf,
     raw_format: String,
     package_address: String,
     orderbook_address: String,
     auth_token: String,
+    previous_chunks: Vec<serde_json::Value>,
+}
+
+#[derive(Default)]
+struct RecordResumeState {
+    last_success_version: Option<u64>,
+    next_start_version: Option<u64>,
+    chunks: Vec<serde_json::Value>,
+}
+
+fn load_record_resume_state(out_dir: &Path) -> Result<RecordResumeState> {
+    let checkpoint_path = out_dir.join("record_checkpoint.json");
+    if !checkpoint_path.exists() {
+        return Ok(RecordResumeState::default());
+    }
+
+    let value = read_json::<serde_json::Value>(&checkpoint_path)?;
+    let last_success_version = value
+        .get("last_success_version")
+        .and_then(serde_json::Value::as_u64);
+    let next_start_version = value
+        .get("next_start_version")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| last_success_version.and_then(|version| version.checked_add(1)));
+    let chunks = value
+        .get("chunks")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    Ok(RecordResumeState {
+        last_success_version,
+        next_start_version,
+        chunks,
+    })
+}
+
+fn resolve_record_start_version(
+    requested_start_version: Option<u64>,
+    resume: bool,
+    resume_state: &RecordResumeState,
+) -> Result<u64> {
+    if resume {
+        if let Some(next_start_version) = resume_state.next_start_version {
+            return Ok(next_start_version);
+        }
+        return requested_start_version.ok_or_else(|| {
+            HotIndexError::Config(
+                "--resume requires record_checkpoint.json with next_start_version or an explicit --start-version"
+                    .to_string(),
+            )
+        });
+    }
+
+    Ok(requested_start_version.unwrap_or(0))
+}
+
+fn resolve_record_end_version(
+    start_version: u64,
+    requested_end_version: Option<u64>,
+    transactions_count: Option<u64>,
+) -> Result<Option<u64>> {
+    match (requested_end_version, transactions_count) {
+        (Some(_), Some(_)) => Err(HotIndexError::Config(
+            "--end-version and --transactions-count cannot be used together".to_string(),
+        )),
+        (Some(end_version), None) => Ok(Some(end_version)),
+        (None, Some(0)) => Err(HotIndexError::Config(
+            "--transactions-count must be greater than zero".to_string(),
+        )),
+        (None, Some(count)) => start_version
+            .checked_add(count - 1)
+            .map(Some)
+            .ok_or_else(|| {
+                HotIndexError::Config(
+                    "--transactions-count overflows u64 version range".to_string(),
+                )
+            }),
+        (None, None) => Ok(None),
+    }
 }
 
 async fn record_live_transaction_stream(request: LiveRecordRequest) -> Result<()> {
@@ -414,11 +566,6 @@ async fn record_live_transaction_stream(request: LiveRecordRequest) -> Result<()
             .map_err(|_| HotIndexError::Config("invalid request-name metadata".to_string()))?,
     );
 
-    let tmp_path = request.out_dir.join(format!(
-        "transactions_{}_{}.pb.zst.tmp",
-        request.start_version, request.end_version
-    ));
-    let mut writer = TransactionChunkWriter::create(&tmp_path)?;
     let mut key_writer = RecordKeyWriter::create(&request, expected_count)?;
     let mut stream = client
         .get_transactions(grpc_request)
@@ -429,20 +576,102 @@ async fn record_live_transaction_stream(request: LiveRecordRequest) -> Result<()
     let mut count = 0_u64;
     let mut last_version = None;
     let mut chain_id = None;
-    while let Some(response) = stream
-        .message()
-        .await
-        .map_err(|error| HotIndexError::Config(error.to_string()))?
-    {
+    let mut uncompressed_raw_bytes = 0_u64;
+    let mut stopped_at_byte_limit = false;
+    let mut chunks = request.previous_chunks.clone();
+    let mut active_chunk = None;
+
+    'stream: loop {
+        let response = match stream.message().await {
+            Ok(Some(response)) => response,
+            Ok(None) => break,
+            Err(error) => {
+                let stream_error = error.to_string();
+                if count > 0 {
+                    finish_active_chunk(&request, &mut active_chunk, &mut chunks)?;
+                    let last_success_version = last_version.unwrap_or(request.start_version);
+                    let key_report = key_writer.finish(&request, last_success_version)?;
+                    write_record_checkpoint(
+                        &request,
+                        "partial",
+                        "recorded partial Aptos Transaction Stream raw protobuf chunks before stream interruption",
+                        chain_id,
+                        count,
+                        uncompressed_raw_bytes,
+                        last_success_version,
+                        &chunks,
+                        Some(key_report),
+                        stopped_at_byte_limit,
+                        Some(stream_error.as_str()),
+                    )?;
+                    return Err(HotIndexError::Config(format!(
+                        "Transaction Stream interrupted after {count} transactions; cursor saved at next_start_version={}",
+                        checked_next_version(last_success_version)?
+                    )));
+                }
+                return Err(HotIndexError::Config(stream_error));
+            }
+        };
+
         chain_id = response.chain_id.or(chain_id);
         for transaction in response.transactions {
+            if request
+                .max_raw_bytes
+                .map(|limit| uncompressed_raw_bytes >= limit)
+                .unwrap_or(false)
+            {
+                stopped_at_byte_limit = true;
+                break 'stream;
+            }
+
+            if active_chunk.is_none() {
+                active_chunk = Some(ActiveTransactionChunkWriter::create(
+                    &request.out_dir,
+                    transaction.version,
+                )?);
+            }
+            let writer = active_chunk.as_mut().ok_or_else(|| {
+                HotIndexError::Config("transaction chunk writer was not initialized".to_string())
+            })?;
+            let bytes_written = writer.write_transaction(&transaction)?;
+            uncompressed_raw_bytes = uncompressed_raw_bytes
+                .checked_add(bytes_written)
+                .ok_or_else(|| {
+                    HotIndexError::Config("recorded raw byte count overflowed u64".to_string())
+                })?;
             last_version = Some(transaction.version);
-            writer.write_transaction(&transaction)?;
             key_writer.write_version(transaction.version, count)?;
             count += 1;
+
+            if writer.transaction_count() >= request.chunk_transaction_count {
+                finish_active_chunk(&request, &mut active_chunk, &mut chunks)?;
+                let last_success_version = last_version.unwrap_or(request.start_version);
+                write_record_checkpoint(
+                    &request,
+                    "recording",
+                    "recorded Aptos Transaction Stream raw protobuf chunk; recording still in progress",
+                    chain_id,
+                    count,
+                    uncompressed_raw_bytes,
+                    last_success_version,
+                    &chunks,
+                    None,
+                    stopped_at_byte_limit,
+                    None,
+                )?;
+            }
+
+            if request
+                .max_raw_bytes
+                .map(|limit| uncompressed_raw_bytes >= limit)
+                .unwrap_or(false)
+            {
+                stopped_at_byte_limit = true;
+                break 'stream;
+            }
         }
     }
-    writer.finish()?;
+    finish_active_chunk(&request, &mut active_chunk, &mut chunks)?;
 
     if count == 0 {
         return Err(HotIndexError::Config(
@@ -450,50 +679,189 @@ async fn record_live_transaction_stream(request: LiveRecordRequest) -> Result<()
         ));
     }
     let last_success_version = last_version.unwrap_or(request.start_version);
-    let final_path = request.out_dir.join(format!(
-        "transactions_{}_{}.pb.zst",
-        request.start_version, last_success_version
-    ));
-    fs::rename(&tmp_path, &final_path)?;
-    let chunk_sha256 = sha256_file(&final_path)?;
     let key_report = key_writer.finish(&request, last_success_version)?;
-    let chunk_name = final_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("transactions.pb.zst")
-        .to_string();
-    let checkpoint = serde_json::json!({
-        "status": "complete",
-        "message": "recorded Aptos Transaction Stream raw protobuf chunk",
-        "network": request.network.as_str(),
-        "endpoint": request.endpoint,
-        "package_address": request.package_address,
-        "orderbook_address": request.orderbook_address,
-        "start_version": request.start_version,
-        "end_version": request.end_version,
-        "raw_format": request.raw_format,
-        "auth_token_present": true,
-        "chain_id": chain_id,
-        "transaction_count": count,
-        "last_success_version": last_success_version,
-        "chunks": [{
-            "path": chunk_name,
-            "first_version": request.start_version,
-            "last_version": last_success_version,
-            "transaction_count": count,
-            "sha256": chunk_sha256
-        }],
-        "key_files": key_report
-    });
-    write_json_pretty(&request.out_dir.join("record_checkpoint.json"), &checkpoint)?;
+    let message = if stopped_at_byte_limit {
+        "recorded Aptos Transaction Stream raw protobuf chunks; stopped at max raw byte limit"
+    } else {
+        "recorded Aptos Transaction Stream raw protobuf chunks"
+    };
+    write_record_checkpoint(
+        &request,
+        "complete",
+        message,
+        chain_id,
+        count,
+        uncompressed_raw_bytes,
+        last_success_version,
+        &chunks,
+        Some(key_report),
+        stopped_at_byte_limit,
+        None,
+    )?;
     println!(
-        "recorded transaction stream: tx={} range={}..{} chunk={}",
+        "recorded transaction stream: tx={} range={}..{} raw_bytes={} next_start_version={}",
         count,
         request.start_version,
         last_success_version,
-        final_path.display()
+        uncompressed_raw_bytes,
+        checked_next_version(last_success_version)?
     );
     Ok(())
+}
+
+fn finish_active_chunk(
+    request: &LiveRecordRequest,
+    active_chunk: &mut Option<ActiveTransactionChunkWriter>,
+    chunks: &mut Vec<serde_json::Value>,
+) -> Result<()> {
+    let Some(chunk) = active_chunk.take() else {
+        return Ok(());
+    };
+    chunks.push(chunk.finish(&request.out_dir)?);
+    Ok(())
+}
+
+struct ActiveTransactionChunkWriter {
+    first_version: u64,
+    last_version: Option<u64>,
+    transaction_count: u64,
+    tmp_path: PathBuf,
+    writer: TransactionChunkWriter,
+}
+
+impl ActiveTransactionChunkWriter {
+    fn create(out_dir: &Path, first_version: u64) -> Result<Self> {
+        let tmp_path = out_dir.join(format!(
+            "transactions_{}_{}.pb.zst.tmp",
+            first_version,
+            std::process::id()
+        ));
+        let writer = TransactionChunkWriter::create(&tmp_path)?;
+        Ok(Self {
+            first_version,
+            last_version: None,
+            transaction_count: 0,
+            tmp_path,
+            writer,
+        })
+    }
+
+    fn write_transaction(&mut self, transaction: &Transaction) -> Result<u64> {
+        let bytes_written = self.writer.write_transaction(transaction)?;
+        self.last_version = Some(transaction.version);
+        self.transaction_count += 1;
+        Ok(bytes_written)
+    }
+
+    fn transaction_count(&self) -> u64 {
+        self.transaction_count
+    }
+
+    fn finish(self, out_dir: &Path) -> Result<serde_json::Value> {
+        let last_version = self.last_version.ok_or_else(|| {
+            HotIndexError::Config("cannot finish empty transaction chunk".to_string())
+        })?;
+        let final_path = out_dir.join(format!(
+            "transactions_{}_{}.pb.zst",
+            self.first_version, last_version
+        ));
+        if final_path.exists() {
+            return Err(HotIndexError::Config(format!(
+                "refusing to overwrite existing raw chunk {}",
+                final_path.display()
+            )));
+        }
+
+        self.writer.finish()?;
+        fs::rename(&self.tmp_path, &final_path)?;
+        let chunk_sha256 = sha256_file(&final_path)?;
+        let chunk_name = final_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("transactions.pb.zst")
+            .to_string();
+        Ok(serde_json::json!({
+            "path": chunk_name,
+            "first_version": self.first_version,
+            "last_version": last_version,
+            "transaction_count": self.transaction_count,
+            "sha256": chunk_sha256
+        }))
+    }
+}
+
+fn write_record_checkpoint(
+    request: &LiveRecordRequest,
+    status: &str,
+    message: &str,
+    chain_id: Option<u64>,
+    run_transaction_count: u64,
+    uncompressed_raw_bytes: u64,
+    last_success_version: u64,
+    chunks: &[serde_json::Value],
+    key_report: Option<serde_json::Value>,
+    stopped_at_byte_limit: bool,
+    stream_error: Option<&str>,
+) -> Result<()> {
+    let total_transaction_count = chunks.iter().try_fold(0_u64, |acc, chunk| {
+        acc.checked_add(chunk_transaction_count(chunk))
+            .ok_or_else(|| {
+                HotIndexError::Config("checkpoint transaction count overflow".to_string())
+            })
+    })?;
+    let mut checkpoint = serde_json::json!({
+        "status": status,
+        "message": message,
+        "network": request.network.as_str(),
+        "endpoint": request.endpoint.as_str(),
+        "package_address": request.package_address.as_str(),
+        "orderbook_address": request.orderbook_address.as_str(),
+        "start_version": request.start_version,
+        "end_version": request.end_version,
+        "requested_start_version": request.requested_start_version,
+        "requested_end_version": request.requested_end_version,
+        "transactions_count": request.transactions_count,
+        "resume": request.resume,
+        "raw_format": request.raw_format.as_str(),
+        "auth_token_present": true,
+        "chain_id": chain_id,
+        "run_transaction_count": run_transaction_count,
+        "transaction_count": total_transaction_count,
+        "uncompressed_raw_bytes": uncompressed_raw_bytes,
+        "max_raw_bytes": request.max_raw_bytes,
+        "chunk_transaction_count": request.chunk_transaction_count,
+        "last_success_version": last_success_version,
+        "next_start_version": checked_next_version(last_success_version)?,
+        "stopped_at_byte_limit": stopped_at_byte_limit,
+        "chunks": chunks,
+    });
+
+    if let serde_json::Value::Object(object) = &mut checkpoint {
+        if let Some(key_report) = key_report {
+            object.insert("key_files".to_string(), key_report);
+        }
+        if let Some(stream_error) = stream_error {
+            object.insert(
+                "stream_error".to_string(),
+                serde_json::Value::String(stream_error.to_string()),
+            );
+        }
+    }
+
+    write_json_pretty(&request.out_dir.join("record_checkpoint.json"), &checkpoint)
+}
+
+fn chunk_transaction_count(chunk: &serde_json::Value) -> u64 {
+    chunk
+        .get("transaction_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+}
+
+fn checked_next_version(version: u64) -> Result<u64> {
+    version
+        .checked_add(1)
+        .ok_or_else(|| HotIndexError::Config("last_success_version cannot advance".to_string()))
 }
 
 struct TransactionChunkWriter {
@@ -513,7 +881,7 @@ impl TransactionChunkWriter {
         })
     }
 
-    fn write_transaction(&mut self, transaction: &Transaction) -> Result<()> {
+    fn write_transaction(&mut self, transaction: &Transaction) -> Result<u64> {
         let Some(encoder) = self.encoder.as_mut() else {
             return Err(HotIndexError::Config(
                 "transaction chunk writer is already finished".to_string(),
@@ -523,8 +891,11 @@ impl TransactionChunkWriter {
         transaction
             .encode_length_delimited(&mut buffer)
             .map_err(|error| HotIndexError::Parse(error.to_string()))?;
+        let bytes_written = buffer.len().try_into().map_err(|_| {
+            HotIndexError::Config("encoded transaction length overflowed u64".to_string())
+        })?;
         encoder.write_all(&buffer)?;
-        Ok(())
+        Ok(bytes_written)
     }
 
     fn finish(mut self) -> Result<()> {
@@ -541,9 +912,47 @@ impl TransactionChunkWriter {
     }
 }
 
+fn read_next_len_delimited_transaction<R: Read>(reader: &mut R) -> Result<Option<Transaction>> {
+    let Some(len) = read_varint_len(reader)? else {
+        return Ok(None);
+    };
+    let len: usize = len
+        .try_into()
+        .map_err(|_| HotIndexError::Parse(format!("protobuf message too large: {len}")))?;
+    let mut buffer = vec![0_u8; len];
+    reader.read_exact(&mut buffer)?;
+    Transaction::decode(buffer.as_slice())
+        .map(Some)
+        .map_err(|error| HotIndexError::Parse(error.to_string()))
+}
+
+fn read_varint_len<R: Read>(reader: &mut R) -> Result<Option<u64>> {
+    let mut len = 0_u64;
+    for idx in 0..10 {
+        let mut byte = [0_u8; 1];
+        match reader.read_exact(&mut byte) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::UnexpectedEof && idx == 0 => return Ok(None),
+            Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+                return Err(HotIndexError::Parse(
+                    "truncated protobuf length prefix".to_string(),
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        len |= u64::from(byte[0] & 0x7f) << (idx * 7);
+        if byte[0] & 0x80 == 0 {
+            return Ok(Some(len));
+        }
+    }
+    Err(HotIndexError::Parse(
+        "protobuf length prefix exceeds 10 bytes".to_string(),
+    ))
+}
+
 struct RecordKeyWriter {
     tx_versions_tmp: PathBuf,
-    tx_versions_final: PathBuf,
+    keys_dir: PathBuf,
     tx_versions: BufWriter<File>,
     sampled_versions: Vec<u64>,
     sample_stride: u64,
@@ -554,17 +963,17 @@ impl RecordKeyWriter {
     fn create(request: &LiveRecordRequest, expected_count: u64) -> Result<Self> {
         let keys_dir = request.out_dir.join("keys");
         fs::create_dir_all(&keys_dir)?;
-        let tx_versions_final = keys_dir.join(format!(
-            "tx_versions_{}_{}.u64be",
-            request.start_version, request.end_version
+        let tx_versions_tmp = keys_dir.join(format!(
+            "tx_versions_{}_{}.u64be.tmp",
+            request.start_version,
+            std::process::id()
         ));
-        let tx_versions_tmp = tx_versions_final.with_extension("u64be.tmp");
         let tx_versions = BufWriter::new(File::create(&tx_versions_tmp)?);
         let sample_limit = request.key_sample_limit.max(1);
         let sample_stride = expected_count.div_ceil(sample_limit).max(1);
         Ok(Self {
             tx_versions_tmp,
-            tx_versions_final,
+            keys_dir,
             tx_versions,
             sampled_versions: Vec::new(),
             sample_stride,
@@ -590,7 +999,17 @@ impl RecordKeyWriter {
         self.tx_versions.flush()?;
         self.tx_versions.get_ref().sync_all()?;
         drop(self.tx_versions);
-        fs::rename(&self.tx_versions_tmp, &self.tx_versions_final)?;
+        let tx_versions_final = self.keys_dir.join(format!(
+            "tx_versions_{}_{}.u64be",
+            request.start_version, last_success_version
+        ));
+        if tx_versions_final.exists() {
+            return Err(HotIndexError::Config(format!(
+                "refusing to overwrite existing key file {}",
+                tx_versions_final.display()
+            )));
+        }
+        fs::rename(&self.tx_versions_tmp, &tx_versions_final)?;
 
         let dataset_root = dataset_root_for_raw_dir(&request.out_dir)?;
         let queries_dir = dataset_root.join("queries");
@@ -613,8 +1032,8 @@ impl RecordKeyWriter {
             "source": "aptos_transaction_stream_record",
             "start_version": request.start_version,
             "last_success_version": last_success_version,
-            "tx_versions_file": artifact_key(&dataset_root, &self.tx_versions_final),
-            "tx_versions_sha256": sha256_file(&self.tx_versions_final)?,
+            "tx_versions_file": artifact_key(&dataset_root, &tx_versions_final),
+            "tx_versions_sha256": sha256_file(&tx_versions_final)?,
             "sample_stride": self.sample_stride,
             "sample_limit": self.sample_limit,
             "sample_count": self.sampled_versions.len(),
@@ -814,27 +1233,31 @@ fn replay_into_engine<E: StorageEngine>(root: &Path, engine: &E) -> Result<()> {
     let manifest = read_json::<DatasetManifest>(&root.join("manifest.json"))?;
     validate_manifest_hashes(root, &manifest)?;
 
-    for tx in read_ndjson::<TxRow>(&normalized.join("txs.ndjson"))? {
-        engine.put_tx(tx)?;
-    }
-    for event in read_ndjson::<NormalizedEvent>(&normalized.join("events.ndjson"))? {
-        engine.put_event(event)?;
-    }
-    for fill in read_ndjson::<FillRow>(&normalized.join("fills.ndjson"))? {
-        engine.put_fill(fill)?;
-    }
-    for order in read_ndjson::<OrderRow>(&normalized.join("orders.ndjson"))? {
-        engine.put_order(order)?;
-    }
-    for position in read_ndjson::<PositionRow>(&normalized.join("positions.ndjson"))? {
-        engine.put_position(position)?;
-    }
-    for row in read_ndjson::<BuilderAttributionRow>(&normalized.join("builder_code_rows.ndjson"))? {
-        engine.put_builder_attribution(row)?;
-    }
-    for row in read_ndjson::<ActivityRow>(&normalized.join("activity_rows.ndjson"))? {
-        engine.put_activity(row)?;
-    }
+    replay_ndjson_rows(&normalized.join("txs.ndjson"), |tx: TxRow| {
+        engine.put_tx(tx)
+    })?;
+    replay_ndjson_rows(
+        &normalized.join("events.ndjson"),
+        |event: NormalizedEvent| engine.put_event(event),
+    )?;
+    replay_ndjson_rows(&normalized.join("fills.ndjson"), |fill: FillRow| {
+        engine.put_fill(fill)
+    })?;
+    replay_ndjson_rows(&normalized.join("orders.ndjson"), |order: OrderRow| {
+        engine.put_order(order)
+    })?;
+    replay_ndjson_rows(
+        &normalized.join("positions.ndjson"),
+        |position: PositionRow| engine.put_position(position),
+    )?;
+    replay_ndjson_rows(
+        &normalized.join("builder_code_rows.ndjson"),
+        |row: BuilderAttributionRow| engine.put_builder_attribution(row),
+    )?;
+    replay_ndjson_rows(
+        &normalized.join("activity_rows.ndjson"),
+        |row: ActivityRow| engine.put_activity(row),
+    )?;
 
     engine.put_ingest_checkpoint(IngestCheckpoint {
         network: manifest.network,
@@ -931,6 +1354,156 @@ fn write_normalized_fixture_dataset(
         hashes: DatasetFileHashes { sha256: hashes },
     };
     write_json_pretty(&dataset_root.join("manifest.json"), &manifest)
+}
+
+fn normalize_protobuf_tx_only(
+    dataset_root: &Path,
+    normalized_dir: &Path,
+    raw_inputs: &[PathBuf],
+    parser_options: &ParserOptions,
+) -> Result<()> {
+    if raw_inputs.is_empty() {
+        return Err(HotIndexError::Config(
+            "no protobuf raw inputs were provided".to_string(),
+        ));
+    }
+
+    fs::create_dir_all(normalized_dir)?;
+    let txs_path = normalized_dir.join("txs.ndjson");
+    let mut tx_writer = BufWriter::new(File::create(&txs_path)?);
+
+    let mut first_version = None;
+    let mut last_version = None;
+    let mut tx_count = 0_u64;
+    for raw_input in raw_inputs {
+        let mut decoder = zstd::stream::read::Decoder::new(File::open(raw_input)?)?;
+        while let Some(transaction) = read_next_len_delimited_transaction(&mut decoder)? {
+            if let Some(previous_version) = last_version {
+                if transaction.version <= previous_version {
+                    return Err(HotIndexError::Config(format!(
+                        "raw chunks are not strictly increasing: {} has version {} after {}",
+                        raw_input.display(),
+                        transaction.version,
+                        previous_version
+                    )));
+                }
+            }
+            first_version.get_or_insert(transaction.version);
+            last_version = Some(transaction.version);
+            let row = tx_row_from_transaction(&transaction, parser_options);
+            serde_json::to_writer(&mut tx_writer, &row).map_err(json_error)?;
+            tx_writer.write_all(b"\n")?;
+            tx_count += 1;
+        }
+    }
+    tx_writer.flush()?;
+
+    write_ndjson::<NormalizedEvent>(&normalized_dir.join("events.ndjson"), &[])?;
+    write_ndjson::<FillRow>(&normalized_dir.join("fills.ndjson"), &[])?;
+    write_ndjson::<OrderRow>(&normalized_dir.join("orders.ndjson"), &[])?;
+    write_ndjson::<PositionRow>(&normalized_dir.join("positions.ndjson"), &[])?;
+    write_ndjson::<BuilderAttributionRow>(&normalized_dir.join("builder_code_rows.ndjson"), &[])?;
+    write_ndjson::<ActivityRow>(&normalized_dir.join("activity_rows.ndjson"), &[])?;
+    write_ndjson::<NormalizedEvent>(&normalized_dir.join("unknown_events.ndjson"), &[])?;
+    fs::write(
+        normalized_dir.join("parse_warnings.log"),
+        "tx-only protobuf normalization: Decibel event extraction is pending\n",
+    )?;
+
+    let mut hashes = BTreeMap::new();
+    for raw_input in raw_inputs {
+        insert_hash(&mut hashes, dataset_root, raw_input)?;
+    }
+    for relative in NORMALIZED_ARTIFACTS {
+        insert_hash(&mut hashes, dataset_root, &dataset_root.join(relative))?;
+    }
+    for relative in QUERY_CORPUS_ARTIFACTS {
+        let path = dataset_root.join(relative);
+        if path.exists() {
+            insert_hash(&mut hashes, dataset_root, &path)?;
+        }
+    }
+
+    let manifest = DatasetManifest {
+        dataset_id: parser_options.dataset_id.clone(),
+        network: parser_options.network,
+        source: "aptos_transaction_stream".to_string(),
+        transaction_stream_endpoint: None,
+        raw_encoding: DatasetEncoding::AptosTransactionProtobufLenDelimitedZstd,
+        normalized_encoding: DatasetEncoding::Ndjson,
+        start_version: first_version.unwrap_or_default(),
+        end_version: last_version,
+        package_address: parser_options.package_address.clone(),
+        orderbook_address: parser_options.orderbook_address.clone(),
+        parser_source: Some("decibel-dataset tx-only protobuf normalizer".to_string()),
+        parser_commit: parser_options.parser_commit.clone(),
+        captured_at: Some(current_epoch_string()),
+        raw_transaction_count: tx_count,
+        decibel_event_count: 0,
+        fill_count: 0,
+        order_count: 0,
+        position_count: 0,
+        builder_code_row_count: 0,
+        hashes: DatasetFileHashes { sha256: hashes },
+    };
+    write_json_pretty(&dataset_root.join("manifest.json"), &manifest)
+}
+
+fn tx_row_from_transaction(transaction: &Transaction, parser_options: &ParserOptions) -> TxRow {
+    TxRow {
+        network: parser_options.network,
+        version: transaction.version,
+        tx_hash: transaction_hash_hex(transaction),
+        block_timestamp_us: transaction_timestamp_us(transaction),
+        event_count: transaction_event_count(transaction),
+        dataset_id: Some(parser_options.dataset_id.clone()),
+        raw_summary: Some(format!(
+            "aptos_transaction_type={} epoch={} block_height={}",
+            transaction.r#type, transaction.epoch, transaction.block_height
+        )),
+    }
+}
+
+fn transaction_hash_hex(transaction: &Transaction) -> String {
+    transaction
+        .info
+        .as_ref()
+        .filter(|info| !info.hash.is_empty())
+        .map(|info| format!("0x{}", bytes_to_hex(&info.hash)))
+        .unwrap_or_else(|| format!("0x{:064x}", transaction.version))
+}
+
+fn transaction_timestamp_us(transaction: &Transaction) -> u64 {
+    let Some(timestamp) = transaction.timestamp else {
+        return 0;
+    };
+    if timestamp.seconds < 0 || timestamp.nanos < 0 {
+        return 0;
+    }
+    timestamp.seconds as u64 * 1_000_000 + timestamp.nanos as u64 / 1_000
+}
+
+fn transaction_event_count(transaction: &Transaction) -> u32 {
+    use aptos_protos::transaction::v1::transaction::TxnData;
+
+    let count = match transaction.txn_data.as_ref() {
+        Some(TxnData::BlockMetadata(txn)) => txn.events.len(),
+        Some(TxnData::Genesis(txn)) => txn.events.len(),
+        Some(TxnData::User(txn)) => txn.events.len(),
+        Some(TxnData::Validator(txn)) => txn.events.len(),
+        Some(TxnData::StateCheckpoint(_)) | Some(TxnData::BlockEpilogue(_)) | None => 0,
+    };
+    count.try_into().unwrap_or(u32::MAX)
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn write_query_corpus_files(out_dir: &Path, corpus: &[QueryCorpusRecord]) -> Result<()> {
@@ -1422,6 +1995,58 @@ fn infer_raw_format(path: &Path) -> &'static str {
     }
 }
 
+fn resolve_protobuf_raw_inputs(input: &Path) -> Result<Vec<PathBuf>> {
+    if input.is_file() {
+        return Ok(vec![input.to_path_buf()]);
+    }
+    if !input.is_dir() {
+        return Err(HotIndexError::Config(format!(
+            "raw input {} is neither a file nor a directory",
+            input.display()
+        )));
+    }
+
+    let mut chunks = Vec::new();
+    for entry in fs::read_dir(input)? {
+        let path = entry?.path();
+        if is_transaction_chunk(&path) {
+            chunks.push(path);
+        }
+    }
+    chunks.sort_by(|left, right| {
+        raw_chunk_start_version(left)
+            .cmp(&raw_chunk_start_version(right))
+            .then_with(|| left.file_name().cmp(&right.file_name()))
+    });
+
+    if chunks.is_empty() {
+        return Err(HotIndexError::Config(format!(
+            "no transactions_*.pb.zst chunks found in {}",
+            input.display()
+        )));
+    }
+    Ok(chunks)
+}
+
+fn is_transaction_chunk(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name.starts_with("transactions_") && name.ends_with(".pb.zst")
+}
+
+fn raw_chunk_start_version(path: &Path) -> Option<u64> {
+    let name = path.file_name()?.to_str()?;
+    name.strip_prefix("transactions_")?
+        .split('_')
+        .next()?
+        .parse()
+        .ok()
+}
+
 fn dataset_root_for_normalized_dir(normalized_dir: &Path) -> Result<PathBuf> {
     if normalized_dir.file_name().and_then(|name| name.to_str()) == Some("normalized") {
         normalized_dir
@@ -1486,6 +2111,50 @@ impl<'a> Args<'a> {
             })
             .transpose()
     }
+
+    fn optional_bytes(&self, name: &str) -> Result<Option<u64>> {
+        self.optional_value(name)
+            .map(|value| parse_byte_size(value, name))
+            .transpose()
+    }
+}
+
+fn parse_byte_size(value: &str, name: &str) -> Result<u64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(HotIndexError::Config(format!(
+            "invalid byte size for {name}: empty value"
+        )));
+    }
+
+    let split_at = value
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (number, suffix) = value.split_at(split_at);
+    if number.is_empty() {
+        return Err(HotIndexError::Config(format!(
+            "invalid byte size for {name}: {value}"
+        )));
+    }
+    let units = number
+        .parse::<u64>()
+        .map_err(|_| HotIndexError::Config(format!("invalid byte size for {name}: {value}")))?;
+    let multiplier = match suffix.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024_u64.pow(2),
+        "g" | "gb" | "gib" => 1024_u64.pow(3),
+        "t" | "tb" | "tib" => 1024_u64.pow(4),
+        other => {
+            return Err(HotIndexError::Config(format!(
+                "unsupported byte size suffix for {name}: {other}"
+            )));
+        }
+    };
+
+    units.checked_mul(multiplier).ok_or_else(|| {
+        HotIndexError::Config(format!("byte size for {name} overflows u64: {value}"))
+    })
 }
 
 fn write_ndjson<T: Serialize>(path: &Path, rows: &[T]) -> Result<()> {
@@ -1533,6 +2202,26 @@ fn read_ndjson<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
     Ok(rows)
 }
 
+fn replay_ndjson_rows<T, F>(path: &Path, mut put: F) -> Result<()>
+where
+    T: DeserializeOwned,
+    F: FnMut(T) -> Result<()>,
+{
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    for (idx, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row = serde_json::from_str(&line).map_err(|error| {
+            HotIndexError::Parse(format!("{}:{}: {error}", path.display(), idx + 1))
+        })?;
+        put(row)?;
+    }
+    Ok(())
+}
+
 fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -1568,6 +2257,13 @@ fn zero_address() -> String {
     "0x0000000000000000000000000000000000000000000000000000000000000000".to_string()
 }
 
+fn current_epoch_string() -> String {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => format!("unix_epoch_seconds:{}", duration.as_secs()),
+        Err(_) => "unix_epoch_seconds:0".to_string(),
+    }
+}
+
 fn print_usage() {
     eprintln!(
         "usage:
@@ -1575,9 +2271,9 @@ fn print_usage() {
   decibel-dataset fixture --out <dataset-dir> [--events <n>] [--config <config.yaml>]
   decibel-dataset build-query-corpus --events <events.ndjson> --out-dir <queries-dir> [--seed <n>]
   decibel-dataset replay --dataset <dataset-dir> [--engine memory]
-  decibel-dataset normalize --input <raw> --out-dir <normalized-dir> [--format fixture-jsonl] [--config <config.yaml>]
-  decibel-dataset inspect-raw --input <transactions.pb.zst> [--limit <n>]
-  decibel-dataset record --live --network mainnet --endpoint <url> [--auth-token <token>|--auth-token-env <env>] [--batch-size <n>] [--key-sample-limit <n>] [--package-address <addr>] [--orderbook-address <addr>] --start-version <n> --end-version <n> --out-dir <raw-dir> --raw-format protobuf-zstd"
+  decibel-dataset normalize --input <raw.pb.zst|raw-dir|fixture.jsonl> --out-dir <normalized-dir> [--format fixture-jsonl|protobuf-zstd] [--config <config.yaml>]
+  decibel-dataset inspect-raw --input <transactions.pb.zst> [--limit <n>] [--allow-truncated]
+  decibel-dataset record --live --network mainnet --endpoint <url> [--auth-token <token>|--auth-token-env <env>] [--resume] [--batch-size <n>] [--chunk-transaction-count <n>] [--max-raw-bytes <10GiB>] [--key-sample-limit <n>] [--package-address <addr>] [--orderbook-address <addr>] (--start-version <n> (--end-version <n>|--transactions-count <n>)|--resume --end-version <n>) --out-dir <raw-dir> --raw-format protobuf-zstd"
     );
 }
 
@@ -1585,9 +2281,9 @@ fn print_usage() {
 mod tests {
     use super::{
         build_query_corpus, build_query_corpus_command, fixture_command, normalize_command,
-        read_json, record_command, replay_into_memory, write_synthetic_dataset, DatasetManifest,
-        HotIndexError, NormalizedEvent, SyntheticDataset, NORMALIZED_ARTIFACTS,
-        QUERY_CORPUS_ARTIFACTS,
+        parse_byte_size, read_json, record_command, replay_into_memory, resolve_record_end_version,
+        write_json_pretty, write_synthetic_dataset, DatasetManifest, HotIndexError,
+        NormalizedEvent, SyntheticDataset, NORMALIZED_ARTIFACTS, QUERY_CORPUS_ARTIFACTS,
     };
     use decibel_hotindex_storage::StorageEngine;
     use std::path::PathBuf;
@@ -1739,6 +2435,52 @@ mod tests {
     }
 
     #[test]
+    fn protobuf_raw_directory_normalizes_all_chunks() {
+        let root = temp_root("protobuf-raw-dir");
+        let _ = std::fs::remove_dir_all(&root);
+        let raw_dir = root.join("raw");
+        std::fs::create_dir_all(&raw_dir).unwrap();
+        write_test_transaction_chunk(&raw_dir.join("transactions_100_101.pb.zst"), 100..=101);
+        write_test_transaction_chunk(&raw_dir.join("transactions_102_103.pb.zst"), 102..=103);
+
+        normalize_command(&[
+            "--input".to_string(),
+            raw_dir.display().to_string(),
+            "--out-dir".to_string(),
+            root.join("normalized").display().to_string(),
+            "--format".to_string(),
+            "protobuf-zstd".to_string(),
+            "--dataset-id".to_string(),
+            "protobuf_raw_dir".to_string(),
+            "--parser-commit".to_string(),
+            "test-commit".to_string(),
+        ])
+        .unwrap();
+
+        let manifest = read_json::<DatasetManifest>(&root.join("manifest.json")).unwrap();
+        assert_eq!(manifest.dataset_id.0, "protobuf_raw_dir");
+        assert_eq!(manifest.start_version, 100);
+        assert_eq!(manifest.end_version, Some(103));
+        assert_eq!(manifest.raw_transaction_count, 4);
+        assert_eq!(manifest.decibel_event_count, 0);
+        assert!(manifest
+            .hashes
+            .sha256
+            .contains_key("raw/transactions_100_101.pb.zst"));
+        assert!(manifest
+            .hashes
+            .sha256
+            .contains_key("raw/transactions_102_103.pb.zst"));
+
+        let engine = replay_into_memory(&root).unwrap();
+        let stats = engine.stats().unwrap();
+        assert_eq!(stats.tx_count, 4);
+        assert_eq!(stats.event_count, 0);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn record_checkpoint_tracks_token_presence_without_secret() {
         let root = temp_root("record-token");
         let _ = std::fs::remove_dir_all(&root);
@@ -1801,7 +2543,89 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn record_resume_uses_checkpoint_cursor() {
+        let root = temp_root("record-resume");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        write_json_pretty(
+            &root.join("record_checkpoint.json"),
+            &serde_json::json!({
+                "status": "complete",
+                "last_success_version": 4365622792_u64,
+                "next_start_version": 4365622793_u64,
+                "chunks": [{
+                    "path": "transactions_4365621793_4365622792.pb.zst",
+                    "first_version": 4365621793_u64,
+                    "last_version": 4365622792_u64,
+                    "transaction_count": 1000_u64,
+                    "sha256": "abc"
+                }]
+            }),
+        )
+        .unwrap();
+
+        record_command(&[
+            "--network".to_string(),
+            "mainnet".to_string(),
+            "--resume".to_string(),
+            "--transactions-count".to_string(),
+            "10".to_string(),
+            "--out-dir".to_string(),
+            root.display().to_string(),
+            "--raw-format".to_string(),
+            "protobuf-zstd".to_string(),
+        ])
+        .unwrap();
+
+        let value = read_json::<serde_json::Value>(&root.join("record_checkpoint.json")).unwrap();
+        assert_eq!(value["start_version"], 4365622793_u64);
+        assert_eq!(value["end_version"], 4365622802_u64);
+        assert_eq!(value["next_start_version"], 4365622793_u64);
+        assert_eq!(value["transaction_count"], 1000_u64);
+        assert_eq!(value["chunks"].as_array().unwrap().len(), 1);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn record_end_version_can_be_derived_from_transaction_count() {
+        assert_eq!(
+            resolve_record_end_version(4365621793, None, Some(10)).unwrap(),
+            Some(4365621802)
+        );
+        let err = resolve_record_end_version(10, Some(20), Some(1)).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("--end-version and --transactions-count"));
+    }
+
+    #[test]
+    fn byte_size_parser_accepts_gib_style_limits() {
+        assert_eq!(
+            parse_byte_size("10G", "--max-raw-bytes").unwrap(),
+            10 * 1024_u64.pow(3)
+        );
+        assert_eq!(
+            parse_byte_size("10240MiB", "--max-raw-bytes").unwrap(),
+            10 * 1024_u64.pow(3)
+        );
+    }
+
     fn temp_root(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("decibel-dataset-{name}-{}", std::process::id()))
+    }
+
+    fn write_test_transaction_chunk(
+        path: &std::path::Path,
+        versions: std::ops::RangeInclusive<u64>,
+    ) {
+        let mut writer = super::TransactionChunkWriter::create(path).unwrap();
+        for version in versions {
+            let mut transaction = aptos_protos::transaction::v1::Transaction::default();
+            transaction.version = version;
+            writer.write_transaction(&transaction).unwrap();
+        }
+        writer.finish().unwrap();
     }
 }

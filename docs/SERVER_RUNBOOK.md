@@ -102,7 +102,9 @@ Expected result:
   "decoded_transactions": 1000,
   "first_version": 4365621793,
   "last_version": 4365622792,
-  "remaining_bytes_after_limit": 0
+  "next_start_version": 4365622793,
+  "truncated_error": null,
+  "stopped_at_limit": false
 }
 ```
 
@@ -176,6 +178,42 @@ rtk cargo run -p decibel-dataset -- record \
 ```
 
 This range contains `15,753,846` transactions. At `130 MiB / 100k tx`, expected local compressed raw size is roughly `20 GiB`. The Geomi billable Transaction Stream size may differ from local `.pb.zst` size, so check dashboard usage after the first large run.
+
+If the previous run hit quota before completing, inspect the raw checkpoint first:
+
+```bash
+rtk read "$DATASET_ROOT/raw/record_checkpoint.json"
+```
+
+Use `next_start_version` for the next run. If there is no checkpoint but a large `transactions_*.pb.zst.tmp` exists, decode that tmp file with `inspect-raw --allow-truncated` and resume from `next_start_version`:
+
+```bash
+rtk cargo run -p decibel-dataset -- inspect-raw \
+  --input "$DATASET_ROOT/raw/transactions_${START_VERSION}_${END_VERSION}.pb.zst.tmp" \
+  --allow-truncated
+```
+
+For the May 30 continuation after the earlier bounded range:
+
+```bash
+export END_VERSION=4381375638
+
+rtk cargo run -p decibel-dataset -- record \
+  --live \
+  --network mainnet \
+  --endpoint grpc.mainnet.aptoslabs.com:443 \
+  --auth-token-env APTOS_GRPC_AUTH_TOKEN \
+  --resume \
+  --end-version "$END_VERSION" \
+  --max-raw-bytes 10GiB \
+  --chunk-transaction-count 100000 \
+  --batch-size 500 \
+  --key-sample-limit 1000000 \
+  --out-dir "$DATASET_ROOT/raw" \
+  --raw-format protobuf-zstd
+```
+
+If no usable checkpoint exists, set `--start-version <last_version_plus_1>` instead of `--resume`. The recorder writes `last_success_version` and `next_start_version` after every completed chunk, so later quota stops are resumable.
 
 The recorder also writes benchmark key artifacts while streaming:
 
