@@ -328,6 +328,8 @@ fn record_command(args: &[String]) -> Result<()> {
     let end_version =
         resolve_record_end_version(start_version, requested_end_version, transactions_count)?;
     let max_raw_bytes = opts.optional_bytes("--max-raw-bytes")?;
+    let max_stream_retries = opts.optional_u64("--max-stream-retries")?.unwrap_or(10);
+    let retry_backoff_ms = opts.optional_u64("--retry-backoff-ms")?.unwrap_or(2_000);
     let record_chunk_transaction_count = opts
         .optional_u64("--chunk-transaction-count")?
         .unwrap_or(DEFAULT_RECORD_CHUNK_TRANSACTION_COUNT);
@@ -346,6 +348,16 @@ fn record_command(args: &[String]) -> Result<()> {
 
     if opts.has_flag("--live") {
         let token = auth_token(&opts)?;
+        if network == Network::Mainnet
+            && start_version < 1_000_000_000
+            && end_version.unwrap_or(0) >= 1_000_000_000
+            && !opts.has_flag("--allow-low-mainnet-start")
+        {
+            return Err(HotIndexError::Config(format!(
+                "suspicious mainnet record range: start_version={start_version}, end_version={}. Did an environment variable or placeholder expand incorrectly? Pass --allow-low-mainnet-start to override.",
+                end_version.unwrap_or(0)
+            )));
+        }
         let request = LiveRecordRequest {
             network,
             endpoint: endpoint.to_string(),
@@ -382,7 +394,11 @@ fn record_command(args: &[String]) -> Result<()> {
         };
         let runtime = tokio::runtime::Runtime::new()
             .map_err(|error| HotIndexError::Config(error.to_string()))?;
-        return runtime.block_on(record_live_transaction_stream(request));
+        return runtime.block_on(record_live_transaction_stream_with_retries(
+            request,
+            max_stream_retries,
+            Duration::from_millis(retry_backoff_ms),
+        ));
     }
 
     let resume_transaction_count = resume_state.chunks.iter().try_fold(0_u64, |acc, chunk| {
@@ -409,6 +425,8 @@ fn record_command(args: &[String]) -> Result<()> {
         "last_success_version": resume_state.last_success_version,
         "next_start_version": resume_state.next_start_version.unwrap_or(start_version),
         "max_raw_bytes": max_raw_bytes,
+        "max_stream_retries": max_stream_retries,
+        "retry_backoff_ms": retry_backoff_ms,
         "chunk_transaction_count": record_chunk_transaction_count,
         "transaction_count": resume_transaction_count,
         "chunks": resume_state.chunks
@@ -418,6 +436,7 @@ fn record_command(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone)]
 struct LiveRecordRequest {
     network: Network,
     endpoint: String,
@@ -440,38 +459,148 @@ struct LiveRecordRequest {
     previous_chunks: Vec<serde_json::Value>,
 }
 
+enum RecordRunOutcome {
+    Complete {
+        next_start_version: u64,
+        raw_bytes: u64,
+        stopped_at_byte_limit: bool,
+    },
+    Interrupted {
+        next_start_version: u64,
+        raw_bytes: u64,
+        stream_error: String,
+    },
+}
+
 #[derive(Default)]
 struct RecordResumeState {
     last_success_version: Option<u64>,
     next_start_version: Option<u64>,
     chunks: Vec<serde_json::Value>,
+    resume_hint: Option<String>,
 }
 
 fn load_record_resume_state(out_dir: &Path) -> Result<RecordResumeState> {
     let checkpoint_path = out_dir.join("record_checkpoint.json");
-    if !checkpoint_path.exists() {
-        return Ok(RecordResumeState::default());
+    let mut state = if checkpoint_path.exists() {
+        let value = read_json::<serde_json::Value>(&checkpoint_path)?;
+        let last_success_version = value
+            .get("last_success_version")
+            .and_then(serde_json::Value::as_u64);
+        let next_start_version = value
+            .get("next_start_version")
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| last_success_version.and_then(|version| version.checked_add(1)));
+        let chunks = value
+            .get("chunks")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        RecordResumeState {
+            last_success_version,
+            next_start_version,
+            chunks,
+            resume_hint: None,
+        }
+    } else {
+        RecordResumeState::default()
+    };
+
+    if state.next_start_version.is_none() {
+        if let Some(inferred) = infer_record_resume_state_from_chunks(out_dir)? {
+            state.last_success_version = inferred.last_success_version;
+            state.next_start_version = inferred.next_start_version;
+            if state.chunks.is_empty() {
+                state.chunks = inferred.chunks;
+            }
+        }
     }
 
-    let value = read_json::<serde_json::Value>(&checkpoint_path)?;
-    let last_success_version = value
-        .get("last_success_version")
-        .and_then(serde_json::Value::as_u64);
-    let next_start_version = value
-        .get("next_start_version")
-        .and_then(serde_json::Value::as_u64)
-        .or_else(|| last_success_version.and_then(|version| version.checked_add(1)));
-    let chunks = value
-        .get("chunks")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    if state.next_start_version.is_none() {
+        state.resume_hint = resume_hint_from_tmp_chunks(out_dir)?;
+    }
 
-    Ok(RecordResumeState {
-        last_success_version,
-        next_start_version,
+    Ok(state)
+}
+
+fn infer_record_resume_state_from_chunks(out_dir: &Path) -> Result<Option<RecordResumeState>> {
+    if !out_dir.exists() {
+        return Ok(None);
+    }
+
+    let mut ranges = Vec::new();
+    for entry in fs::read_dir(out_dir)? {
+        let path = entry?.path();
+        if let Some((first_version, last_version)) = raw_chunk_version_range(&path) {
+            ranges.push((first_version, last_version, path));
+        }
+    }
+    if ranges.is_empty() {
+        return Ok(None);
+    }
+
+    ranges.sort_by_key(|(first_version, last_version, _)| (*first_version, *last_version));
+    let last_success_version = ranges
+        .iter()
+        .map(|(_, last_version, _)| *last_version)
+        .max()
+        .ok_or_else(|| HotIndexError::Config("no raw chunk ranges found".to_string()))?;
+    let mut chunks = Vec::with_capacity(ranges.len());
+    for (first_version, last_version, path) in ranges {
+        let transaction_count = last_version
+            .checked_sub(first_version)
+            .and_then(|span| span.checked_add(1))
+            .ok_or_else(|| {
+                HotIndexError::Config(format!(
+                    "invalid raw chunk version range in {}",
+                    path.display()
+                ))
+            })?;
+        let chunk_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("transactions.pb.zst");
+        chunks.push(serde_json::json!({
+            "path": chunk_name,
+            "first_version": first_version,
+            "last_version": last_version,
+            "transaction_count": transaction_count,
+            "sha256": null,
+            "resume_inferred_from_filename": true
+        }));
+    }
+
+    Ok(Some(RecordResumeState {
+        last_success_version: Some(last_success_version),
+        next_start_version: Some(checked_next_version(last_success_version)?),
         chunks,
-    })
+        resume_hint: None,
+    }))
+}
+
+fn resume_hint_from_tmp_chunks(out_dir: &Path) -> Result<Option<String>> {
+    if !out_dir.exists() {
+        return Ok(None);
+    }
+
+    let mut tmp_chunks = Vec::new();
+    for entry in fs::read_dir(out_dir)? {
+        let path = entry?.path();
+        if is_transaction_tmp_chunk(&path) {
+            tmp_chunks.push(path);
+        }
+    }
+    tmp_chunks.sort();
+    let Some(path) = tmp_chunks.last() else {
+        return Ok(None);
+    };
+
+    Ok(Some(format!(
+        "No completed transactions_*.pb.zst chunk or checkpoint cursor was found. A tmp chunk exists at {}; run `decibel-dataset inspect-raw --input {} --allow-truncated`, then retry record with `--start-version <next_start_version>`.",
+        path.display(),
+        path.display()
+    )))
 }
 
 fn resolve_record_start_version(
@@ -484,10 +613,14 @@ fn resolve_record_start_version(
             return Ok(next_start_version);
         }
         return requested_start_version.ok_or_else(|| {
-            HotIndexError::Config(
-                "--resume requires record_checkpoint.json with next_start_version or an explicit --start-version"
-                    .to_string(),
-            )
+            let mut message =
+                "--resume requires record_checkpoint.json with next_start_version, an existing completed transactions_*.pb.zst chunk, or an explicit --start-version"
+                    .to_string();
+            if let Some(hint) = &resume_state.resume_hint {
+                message.push_str(". ");
+                message.push_str(hint);
+            }
+            HotIndexError::Config(message)
         });
     }
 
@@ -519,7 +652,76 @@ fn resolve_record_end_version(
     }
 }
 
-async fn record_live_transaction_stream(request: LiveRecordRequest) -> Result<()> {
+async fn record_live_transaction_stream_with_retries(
+    mut request: LiveRecordRequest,
+    max_stream_retries: u64,
+    retry_backoff: Duration,
+) -> Result<()> {
+    let initial_max_raw_bytes = request.max_raw_bytes;
+    let mut total_raw_bytes = 0_u64;
+    let mut retries = 0_u64;
+
+    loop {
+        let outcome = record_live_transaction_stream(request.clone()).await?;
+        match outcome {
+            RecordRunOutcome::Complete {
+                next_start_version,
+                raw_bytes,
+                stopped_at_byte_limit,
+            } => {
+                total_raw_bytes = total_raw_bytes.checked_add(raw_bytes).ok_or_else(|| {
+                    HotIndexError::Config("recorded raw byte count overflowed u64".to_string())
+                })?;
+                if stopped_at_byte_limit {
+                    eprintln!(
+                        "record stopped at byte limit after {total_raw_bytes} raw bytes; next_start_version={next_start_version}"
+                    );
+                }
+                return Ok(());
+            }
+            RecordRunOutcome::Interrupted {
+                next_start_version,
+                raw_bytes,
+                stream_error,
+            } => {
+                total_raw_bytes = total_raw_bytes.checked_add(raw_bytes).ok_or_else(|| {
+                    HotIndexError::Config("recorded raw byte count overflowed u64".to_string())
+                })?;
+                if next_start_version > request.end_version {
+                    return Ok(());
+                }
+                if let Some(limit) = initial_max_raw_bytes {
+                    if total_raw_bytes >= limit {
+                        eprintln!(
+                            "record stopped after interruption because byte limit was reached; next_start_version={next_start_version}"
+                        );
+                        return Ok(());
+                    }
+                    request.max_raw_bytes = Some(limit - total_raw_bytes);
+                }
+                if retries >= max_stream_retries {
+                    return Err(HotIndexError::Config(format!(
+                        "Transaction Stream interrupted after retry limit; cursor saved at next_start_version={next_start_version}; last error: {stream_error}"
+                    )));
+                }
+                retries += 1;
+                eprintln!(
+                    "Transaction Stream interrupted; retry {retries}/{max_stream_retries} from version {next_start_version} after {} ms",
+                    retry_backoff.as_millis()
+                );
+                std::thread::sleep(retry_backoff);
+
+                let resume_state = load_record_resume_state(&request.out_dir)?;
+                request.start_version = next_start_version;
+                request.requested_start_version = Some(next_start_version);
+                request.resume = true;
+                request.previous_chunks = resume_state.chunks;
+            }
+        }
+    }
+}
+
+async fn record_live_transaction_stream(request: LiveRecordRequest) -> Result<RecordRunOutcome> {
     if request.end_version < request.start_version {
         return Err(HotIndexError::Config(format!(
             "end-version {} is before start-version {}",
@@ -604,10 +806,11 @@ async fn record_live_transaction_stream(request: LiveRecordRequest) -> Result<()
                         stopped_at_byte_limit,
                         Some(stream_error.as_str()),
                     )?;
-                    return Err(HotIndexError::Config(format!(
-                        "Transaction Stream interrupted after {count} transactions; cursor saved at next_start_version={}",
-                        checked_next_version(last_success_version)?
-                    )));
+                    return Ok(RecordRunOutcome::Interrupted {
+                        next_start_version: checked_next_version(last_success_version)?,
+                        raw_bytes: uncompressed_raw_bytes,
+                        stream_error,
+                    });
                 }
                 return Err(HotIndexError::Config(stream_error));
             }
@@ -706,7 +909,11 @@ async fn record_live_transaction_stream(request: LiveRecordRequest) -> Result<()
         uncompressed_raw_bytes,
         checked_next_version(last_success_version)?
     );
-    Ok(())
+    Ok(RecordRunOutcome::Complete {
+        next_start_version: checked_next_version(last_success_version)?,
+        raw_bytes: uncompressed_raw_bytes,
+        stopped_at_byte_limit,
+    })
 }
 
 fn finish_active_chunk(
@@ -2039,12 +2246,31 @@ fn is_transaction_chunk(path: &Path) -> bool {
 }
 
 fn raw_chunk_start_version(path: &Path) -> Option<u64> {
+    raw_chunk_version_range(path).map(|(start_version, _)| start_version)
+}
+
+fn raw_chunk_version_range(path: &Path) -> Option<(u64, u64)> {
     let name = path.file_name()?.to_str()?;
-    name.strip_prefix("transactions_")?
-        .split('_')
-        .next()?
-        .parse()
-        .ok()
+    let range = name
+        .strip_prefix("transactions_")?
+        .strip_suffix(".pb.zst")?;
+    let mut parts = range.split('_');
+    let first_version = parts.next()?.parse().ok()?;
+    let last_version = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((first_version, last_version))
+}
+
+fn is_transaction_tmp_chunk(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name.starts_with("transactions_") && name.ends_with(".pb.zst.tmp")
 }
 
 fn dataset_root_for_normalized_dir(normalized_dir: &Path) -> Result<PathBuf> {
@@ -2273,7 +2499,7 @@ fn print_usage() {
   decibel-dataset replay --dataset <dataset-dir> [--engine memory]
   decibel-dataset normalize --input <raw.pb.zst|raw-dir|fixture.jsonl> --out-dir <normalized-dir> [--format fixture-jsonl|protobuf-zstd] [--config <config.yaml>]
   decibel-dataset inspect-raw --input <transactions.pb.zst> [--limit <n>] [--allow-truncated]
-  decibel-dataset record --live --network mainnet --endpoint <url> [--auth-token <token>|--auth-token-env <env>] [--resume] [--batch-size <n>] [--chunk-transaction-count <n>] [--max-raw-bytes <10GiB>] [--key-sample-limit <n>] [--package-address <addr>] [--orderbook-address <addr>] (--start-version <n> (--end-version <n>|--transactions-count <n>)|--resume --end-version <n>) --out-dir <raw-dir> --raw-format protobuf-zstd"
+  decibel-dataset record --live --network mainnet --endpoint <url> [--auth-token <token>|--auth-token-env <env>] [--resume] [--allow-low-mainnet-start] [--batch-size <n>] [--chunk-transaction-count <n>] [--max-raw-bytes <10GiB>] [--max-stream-retries <n>] [--retry-backoff-ms <n>] [--key-sample-limit <n>] [--package-address <addr>] [--orderbook-address <addr>] (--start-version <n> (--end-version <n>|--transactions-count <n>)|--resume --end-version <n>) --out-dir <raw-dir> --raw-format protobuf-zstd"
     );
 }
 
@@ -2586,6 +2812,96 @@ mod tests {
         assert_eq!(value["chunks"].as_array().unwrap().len(), 1);
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn record_resume_infers_cursor_from_completed_chunk_name() {
+        let root = temp_root("record-resume-chunk");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("transactions_4365621793_4365622792.pb.zst"), "").unwrap();
+
+        record_command(&[
+            "--network".to_string(),
+            "mainnet".to_string(),
+            "--resume".to_string(),
+            "--transactions-count".to_string(),
+            "10".to_string(),
+            "--out-dir".to_string(),
+            root.display().to_string(),
+            "--raw-format".to_string(),
+            "protobuf-zstd".to_string(),
+        ])
+        .unwrap();
+
+        let value = read_json::<serde_json::Value>(&root.join("record_checkpoint.json")).unwrap();
+        assert_eq!(value["start_version"], 4365622793_u64);
+        assert_eq!(value["end_version"], 4365622802_u64);
+        assert_eq!(value["transaction_count"], 1000_u64);
+        assert_eq!(value["chunks"][0]["resume_inferred_from_filename"], true);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn record_resume_error_points_at_tmp_chunk_recovery() {
+        let root = temp_root("record-resume-tmp");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("transactions_4365621793_4381375638.pb.zst.tmp"),
+            "",
+        )
+        .unwrap();
+
+        let err = record_command(&[
+            "--network".to_string(),
+            "mainnet".to_string(),
+            "--resume".to_string(),
+            "--transactions-count".to_string(),
+            "10".to_string(),
+            "--out-dir".to_string(),
+            root.display().to_string(),
+            "--raw-format".to_string(),
+            "protobuf-zstd".to_string(),
+        ])
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("inspect-raw"));
+        assert!(message.contains("--allow-truncated"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn live_record_rejects_suspicious_low_mainnet_start() {
+        let root = temp_root("record-low-mainnet-start");
+        let _ = std::fs::remove_dir_all(&root);
+        std::env::set_var("DECIBEL_DATASET_TEST_AUTH_TOKEN", "token");
+
+        let err = record_command(&[
+            "--live".to_string(),
+            "--network".to_string(),
+            "mainnet".to_string(),
+            "--endpoint".to_string(),
+            "grpc.mainnet.aptoslabs.com:443".to_string(),
+            "--auth-token-env".to_string(),
+            "DECIBEL_DATASET_TEST_AUTH_TOKEN".to_string(),
+            "--start-version".to_string(),
+            "237432".to_string(),
+            "--end-version".to_string(),
+            "4381375638".to_string(),
+            "--out-dir".to_string(),
+            root.display().to_string(),
+            "--raw-format".to_string(),
+            "protobuf-zstd".to_string(),
+        ])
+        .unwrap_err();
+
+        assert!(err.to_string().contains("suspicious mainnet record range"));
+
+        std::env::remove_var("DECIBEL_DATASET_TEST_AUTH_TOKEN");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
