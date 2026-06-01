@@ -1597,27 +1597,39 @@ fn normalize_protobuf_tx_only(
 
     let mut first_version = None;
     let mut last_version = None;
-    let mut tx_count = 0_u64;
+    let mut previous_decoded_version = None;
+    let mut decoded_tx_count = 0_u64;
+    let mut unique_tx_count = 0_u64;
+    let mut duplicate_tx_count = 0_u64;
+    let mut out_of_order_tx_count = 0_u64;
+    let mut seen_versions = BTreeSet::new();
     atomic_write(&txs_path, |tx_writer| {
         for raw_input in raw_inputs {
             let mut decoder = zstd::stream::read::Decoder::new(File::open(raw_input)?)?;
             while let Some(transaction) = read_next_len_delimited_transaction(&mut decoder)? {
-                if let Some(previous_version) = last_version {
+                decoded_tx_count += 1;
+                if let Some(previous_version) = previous_decoded_version {
                     if transaction.version <= previous_version {
-                        return Err(HotIndexError::Config(format!(
-                            "raw chunks are not strictly increasing: {} has version {} after {}",
-                            raw_input.display(),
-                            transaction.version,
-                            previous_version
-                        )));
+                        out_of_order_tx_count += 1;
                     }
                 }
-                first_version.get_or_insert(transaction.version);
-                last_version = Some(transaction.version);
+                previous_decoded_version = Some(transaction.version);
+
+                if !seen_versions.insert(transaction.version) {
+                    duplicate_tx_count += 1;
+                    continue;
+                }
+
+                first_version = Some(first_version.map_or(transaction.version, |version: u64| {
+                    version.min(transaction.version)
+                }));
+                last_version = Some(last_version.map_or(transaction.version, |version: u64| {
+                    version.max(transaction.version)
+                }));
                 let row = tx_row_from_transaction(&transaction, parser_options);
                 serde_json::to_writer(&mut *tx_writer, &row).map_err(json_error)?;
                 tx_writer.write_all(b"\n")?;
-                tx_count += 1;
+                unique_tx_count += 1;
             }
         }
         Ok(())
@@ -1632,7 +1644,13 @@ fn normalize_protobuf_tx_only(
     write_ndjson::<NormalizedEvent>(&normalized_dir.join("unknown_events.ndjson"), &[])?;
     write_text(
         &normalized_dir.join("parse_warnings.log"),
-        "tx-only protobuf normalization: Decibel event extraction is pending\n",
+        &format!(
+            "tx-only protobuf normalization: Decibel event extraction is pending\n\
+decoded_transactions={decoded_tx_count}\n\
+unique_transactions={unique_tx_count}\n\
+duplicate_transactions_skipped={duplicate_tx_count}\n\
+out_of_order_or_duplicate_transitions={out_of_order_tx_count}\n"
+        ),
     )?;
 
     let mut hashes = BTreeMap::new();
@@ -1663,7 +1681,7 @@ fn normalize_protobuf_tx_only(
         parser_source: Some("decibel-dataset tx-only protobuf normalizer".to_string()),
         parser_commit: parser_options.parser_commit.clone(),
         captured_at: Some(current_epoch_string()),
-        raw_transaction_count: tx_count,
+        raw_transaction_count: unique_tx_count,
         decibel_event_count: 0,
         fill_count: 0,
         order_count: 0,
@@ -2757,6 +2775,46 @@ mod tests {
     }
 
     #[test]
+    fn protobuf_normalize_skips_duplicate_versions() {
+        let root = temp_root("protobuf-duplicate-versions");
+        let _ = std::fs::remove_dir_all(&root);
+        let raw_dir = root.join("raw");
+        std::fs::create_dir_all(&raw_dir).unwrap();
+        write_test_transaction_versions(
+            &raw_dir.join("transactions_100_103.pb.zst"),
+            &[100, 101, 102, 100, 103],
+        );
+
+        normalize_command(&[
+            "--input".to_string(),
+            raw_dir.display().to_string(),
+            "--out-dir".to_string(),
+            root.join("normalized").display().to_string(),
+            "--format".to_string(),
+            "protobuf-zstd".to_string(),
+            "--dataset-id".to_string(),
+            "protobuf_duplicate_versions".to_string(),
+        ])
+        .unwrap();
+
+        let manifest = read_json::<DatasetManifest>(&root.join("manifest.json")).unwrap();
+        assert_eq!(manifest.start_version, 100);
+        assert_eq!(manifest.end_version, Some(103));
+        assert_eq!(manifest.raw_transaction_count, 4);
+
+        let warnings = std::fs::read_to_string(root.join("normalized/parse_warnings.log")).unwrap();
+        assert!(warnings.contains("decoded_transactions=5"));
+        assert!(warnings.contains("unique_transactions=4"));
+        assert!(warnings.contains("duplicate_transactions_skipped=1"));
+
+        let engine = replay_into_memory(&root).unwrap();
+        let stats = engine.stats().unwrap();
+        assert_eq!(stats.tx_count, 4);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn record_checkpoint_tracks_token_presence_without_secret() {
         let root = temp_root("record-token");
         let _ = std::fs::remove_dir_all(&root);
@@ -2986,8 +3044,13 @@ mod tests {
         path: &std::path::Path,
         versions: std::ops::RangeInclusive<u64>,
     ) {
+        let versions: Vec<_> = versions.collect();
+        write_test_transaction_versions(path, &versions);
+    }
+
+    fn write_test_transaction_versions(path: &std::path::Path, versions: &[u64]) {
         let mut writer = super::TransactionChunkWriter::create(path).unwrap();
-        for version in versions {
+        for version in versions.iter().copied() {
             let mut transaction = aptos_protos::transaction::v1::Transaction::default();
             transaction.version = version;
             writer.write_transaction(&transaction).unwrap();

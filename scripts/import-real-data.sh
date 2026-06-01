@@ -7,6 +7,8 @@ Usage:
   scripts/import-real-data.sh <rocksdb|toplingdb|both> <dataset-root> [options]
 
 Options:
+  --bin-dir <path>         Directory containing decibel-dataset and decibel-admin binaries.
+                           Default: DECIBEL_BIN_DIR, then target/release, then target/debug.
   --raw-input <path>       Raw .pb.zst chunk or raw directory. Default: <dataset-root>/raw
   --skip-normalize         Reuse existing <dataset-root>/normalized and manifest.json
   --force-normalize        Rebuild normalized tx-only artifacts even if they already exist
@@ -18,6 +20,7 @@ Options:
   --toplingdb-conf <path>  Sets TOPLINGDB_EASY_MIGRATE_CONF for ToplingDB
 
 Examples:
+  cargo build -p decibel-dataset -p decibel-admin --features rocksdb --release
   scripts/import-real-data.sh rocksdb /data/decibel-hotindex/datasets/mainnet-4365621793-4381375638
   scripts/import-real-data.sh both /data/decibel-hotindex/datasets/mainnet-4365621793-4381375638 --force
 USAGE
@@ -39,11 +42,43 @@ run_cmd() {
   fi
 }
 
+default_bin_dir() {
+  if [[ -x "$repo_root/target/release/decibel-dataset" && -x "$repo_root/target/release/decibel-admin" ]]; then
+    echo "$repo_root/target/release"
+    return
+  fi
+  if [[ -x "$repo_root/target/debug/decibel-dataset" && -x "$repo_root/target/debug/decibel-admin" ]]; then
+    echo "$repo_root/target/debug"
+    return
+  fi
+  return 1
+}
+
+build_hint() {
+  if [[ "$backend" == "toplingdb" || "$backend" == "both" ]]; then
+    echo "rtk cargo build -p decibel-dataset -p decibel-admin --features toplingsdb --release"
+  else
+    echo "rtk cargo build -p decibel-dataset -p decibel-admin --features rocksdb --release"
+  fi
+}
+
+resolve_binaries() {
+  if [[ -z "$bin_dir" ]]; then
+    bin_dir="$(default_bin_dir)" || die "could not find compiled decibel binaries; build first with: $(build_hint)"
+  fi
+
+  dataset_bin="$bin_dir/decibel-dataset"
+  admin_bin="$bin_dir/decibel-admin"
+  [[ -x "$dataset_bin" ]] || die "missing executable: $dataset_bin; build first with: $(build_hint)"
+  [[ -x "$admin_bin" ]] || die "missing executable: $admin_bin; build first with: $(build_hint)"
+}
+
 if [[ $# -lt 2 ]]; then
   usage
   exit 2
 fi
 
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 backend="$1"
 dataset_root="$2"
 shift 2
@@ -57,6 +92,9 @@ case "$backend" in
 esac
 
 raw_input=""
+bin_dir="${DECIBEL_BIN_DIR:-}"
+dataset_bin=""
+admin_bin=""
 skip_normalize=0
 force_normalize=0
 force=0
@@ -68,6 +106,10 @@ toplingdb_conf="${TOPLINGDB_EASY_MIGRATE_CONF:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --bin-dir)
+      bin_dir="${2:-}"
+      shift 2
+      ;;
     --raw-input)
       raw_input="${2:-}"
       shift 2
@@ -121,6 +163,8 @@ if [[ -z "$raw_input" ]]; then
   raw_input="$dataset_root/raw"
 fi
 
+resolve_binaries
+
 normalize_dataset() {
   if [[ "$skip_normalize" -eq 1 ]]; then
     [[ -f "$dataset_root/manifest.json" ]] || die "--skip-normalize requires $dataset_root/manifest.json"
@@ -136,7 +180,7 @@ normalize_dataset() {
   [[ -e "$raw_input" ]] || die "raw input does not exist: $raw_input"
 
   args=(
-    cargo run -p decibel-dataset -- normalize
+    "$dataset_bin" normalize
     --input "$raw_input"
     --out-dir "$dataset_root/normalized"
     --format protobuf-zstd
@@ -157,12 +201,10 @@ normalize_dataset() {
 
 import_backend() {
   local target_backend="$1"
-  local feature="$target_backend"
   local db_path="$dataset_root/materialized/$target_backend"
   local checksum_path="$dataset_root/reports/${target_backend}-checksums.json"
 
   if [[ "$target_backend" == "toplingdb" ]]; then
-    feature="toplingsdb"
     if [[ -n "$toplingdb_conf" ]]; then
       export TOPLINGDB_EASY_MIGRATE_CONF="$toplingdb_conf"
     fi
@@ -179,12 +221,12 @@ import_backend() {
 
   mkdir -p "$dataset_root/materialized" "$dataset_root/reports"
 
-  run_cmd cargo run -p decibel-dataset --features "$feature" -- replay \
+  run_cmd "$dataset_bin" replay \
     --dataset "$dataset_root" \
     --engine "$target_backend" \
     --db-path "$db_path"
 
-  run_cmd cargo run -p decibel-admin --features "$feature" -- checksum \
+  run_cmd "$admin_bin" checksum \
     --engine "$target_backend" \
     --db-path "$db_path" \
     --out "$checksum_path"
@@ -202,7 +244,7 @@ case "$backend" in
   both)
     import_backend rocksdb
     import_backend toplingdb
-    run_cmd cargo run -p decibel-admin -- compare-checksum \
+    run_cmd "$admin_bin" compare-checksum \
       --left "$dataset_root/reports/rocksdb-checksums.json" \
       --right "$dataset_root/reports/toplingdb-checksums.json"
     ;;

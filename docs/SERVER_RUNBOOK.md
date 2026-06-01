@@ -253,7 +253,8 @@ rtk cargo test -p decibel-hotindex-storage --features rocksdb
 Import downloaded raw chunks into RocksDB:
 
 ```bash
-rtk ./scripts/import-real-data.sh rocksdb "$DATASET_ROOT"
+rtk cargo build -p decibel-dataset -p decibel-admin --features rocksdb --release
+rtk ./scripts/import-real-data.sh rocksdb "$DATASET_ROOT" --bin-dir target/release
 ```
 
 The script normalizes `$DATASET_ROOT/raw/transactions_*.pb.zst` into tx-only normalized artifacts, replays them into `$DATASET_ROOT/materialized/rocksdb`, and writes `$DATASET_ROOT/reports/rocksdb-checksums.json`.
@@ -332,14 +333,18 @@ rtk cargo check -p decibel-hotindex-bench --features toplingsdb
 ToplingDB import:
 
 ```bash
+rtk cargo build -p decibel-dataset -p decibel-admin --features toplingsdb --release
 rtk ./scripts/import-real-data.sh toplingdb "$DATASET_ROOT" \
+  --bin-dir target/release \
   --toplingdb-conf "$TOPLINGDB_EASY_MIGRATE_CONF"
 ```
 
 To import both backends and compare checksums:
 
 ```bash
+rtk cargo build -p decibel-dataset -p decibel-admin --features toplingsdb --release
 rtk ./scripts/import-real-data.sh both "$DATASET_ROOT" \
+  --bin-dir target/release \
   --toplingdb-conf "$TOPLINGDB_EASY_MIGRATE_CONF"
 ```
 

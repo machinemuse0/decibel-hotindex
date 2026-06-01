@@ -139,20 +139,23 @@ Expected result:
 After raw chunks are downloaded under `<dataset>/raw`, import the transaction rows into RocksDB:
 
 ```bash
-rtk ./scripts/import-real-data.sh rocksdb <dataset>
+rtk cargo build -p decibel-dataset -p decibel-admin --features rocksdb --release
+rtk ./scripts/import-real-data.sh rocksdb <dataset> --bin-dir target/release
 ```
 
 Import ToplingDB from the same normalized dataset:
 
 ```bash
 export TOPLINGDB_EASY_MIGRATE_CONF=/path/to/topling_sui.yaml
-rtk ./scripts/import-real-data.sh toplingdb <dataset>
+rtk cargo build -p decibel-dataset -p decibel-admin --features toplingsdb --release
+rtk ./scripts/import-real-data.sh toplingdb <dataset> --bin-dir target/release
 ```
 
 Or run both backends and compare checksums:
 
 ```bash
-rtk ./scripts/import-real-data.sh both <dataset>
+rtk cargo build -p decibel-dataset -p decibel-admin --features toplingsdb --release
+rtk ./scripts/import-real-data.sh both <dataset> --bin-dir target/release
 ```
 
 This is currently tx-only for real protobuf data: transaction rows are imported, while Decibel fills/orders/positions/builder rows stay empty until event extraction lands.
