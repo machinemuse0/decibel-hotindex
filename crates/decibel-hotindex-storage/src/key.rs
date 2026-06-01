@@ -30,11 +30,9 @@ pub fn event_by_type_version(
     version: u64,
     event_idx: u32,
 ) -> Vec<u8> {
-    join_segments(&[
-        event_type.as_key().as_bytes(),
-        &be_u64(version),
-        &be_u32(event_idx),
-    ])
+    let event_key = event_type.as_key();
+    assert_text_segments(&[&event_key]);
+    join_segments(&[event_key.as_bytes(), &be_u64(version), &be_u32(event_idx)])
 }
 
 pub fn fills_by_market_time(
@@ -43,6 +41,7 @@ pub fn fills_by_market_time(
     version: u64,
     fill_id: &str,
 ) -> Vec<u8> {
+    assert_text_segments(&[market_id, fill_id]);
     join_segments(&[
         market_id.as_bytes(),
         &reverse_ts_key(timestamp_us),
@@ -52,6 +51,7 @@ pub fn fills_by_market_time(
 }
 
 pub fn fills_by_market_prefix(market_id: &str) -> Vec<u8> {
+    assert_text_segments(&[market_id]);
     prefix_segments(&[market_id.as_bytes()])
 }
 
@@ -61,6 +61,7 @@ pub fn fills_by_account_time(
     market_id: &str,
     fill_id: &str,
 ) -> Vec<u8> {
+    assert_text_segments(&[account, market_id, fill_id]);
     join_segments(&[
         account.as_bytes(),
         &reverse_ts_key(timestamp_us),
@@ -70,18 +71,22 @@ pub fn fills_by_account_time(
 }
 
 pub fn fills_by_account_prefix(account: &str) -> Vec<u8> {
+    assert_text_segments(&[account]);
     prefix_segments(&[account.as_bytes()])
 }
 
 pub fn order_by_id(order_id: &str) -> Vec<u8> {
+    assert_text_segments(&[order_id]);
     order_id.as_bytes().to_vec()
 }
 
 pub fn positions_by_account_market(account: &str, market_id: &str) -> Vec<u8> {
+    assert_text_segments(&[account, market_id]);
     join_segments(&[account.as_bytes(), market_id.as_bytes()])
 }
 
 pub fn positions_by_account_prefix(account: &str) -> Vec<u8> {
+    assert_text_segments(&[account]);
     prefix_segments(&[account.as_bytes()])
 }
 
@@ -91,6 +96,7 @@ pub fn builder_code_fills(
     market_id: &str,
     fill_id: &str,
 ) -> Vec<u8> {
+    assert_text_segments(&[builder_addr, market_id, fill_id]);
     join_segments(&[
         builder_addr.as_bytes(),
         &reverse_ts_key(timestamp_us),
@@ -100,6 +106,7 @@ pub fn builder_code_fills(
 }
 
 pub fn builder_code_fills_prefix(builder_addr: &str) -> Vec<u8> {
+    assert_text_segments(&[builder_addr]);
     prefix_segments(&[builder_addr.as_bytes()])
 }
 
@@ -110,6 +117,7 @@ pub fn market_activity(
     version: u64,
     event_idx: u32,
 ) -> Vec<u8> {
+    assert_text_segments(&[market_id, activity_type]);
     join_segments(&[
         market_id.as_bytes(),
         &reverse_ts_key(timestamp_us),
@@ -120,15 +128,13 @@ pub fn market_activity(
 }
 
 pub fn market_activity_prefix(market_id: &str) -> Vec<u8> {
+    assert_text_segments(&[market_id]);
     prefix_segments(&[market_id.as_bytes()])
 }
 
 pub fn ingest_checkpoint(network: Network, package_address: &str) -> Vec<u8> {
+    assert_text_segments(&[network.as_str(), package_address]);
     join_segments(&[network.as_str().as_bytes(), package_address.as_bytes()])
-}
-
-pub fn checksum_logical_cf(cf_name: &str) -> Vec<u8> {
-    cf_name.as_bytes().to_vec()
 }
 
 fn join_segments(segments: &[&[u8]]) -> Vec<u8> {
@@ -147,6 +153,15 @@ fn prefix_segments(segments: &[&[u8]]) -> Vec<u8> {
     let mut key = join_segments(segments);
     key.push(SEP);
     key
+}
+
+fn assert_text_segments(segments: &[&str]) {
+    for segment in segments {
+        debug_assert!(
+            !segment.as_bytes().contains(&SEP),
+            "text key segment contains the reserved 0x00 separator"
+        );
+    }
 }
 
 #[cfg(test)]

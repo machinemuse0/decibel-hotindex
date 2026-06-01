@@ -5,6 +5,8 @@ use decibel_hotindex_core::{
     IngestCheckpoint, NormalizedEvent, OrderRow, PositionRow, Result, StorageStats, TimeWindow,
     TxRow,
 };
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::RwLock;
 
@@ -166,13 +168,20 @@ impl StorageEngine for MemoryEngine {
         builder_addr: &str,
         window: TimeWindow,
     ) -> Result<Option<BuilderVolumeRow>> {
-        let rows: Vec<_> = self
-            .read()?
+        let inner = self.read()?;
+        let rows: Vec<_> = inner
             .builder_attributions_by_fill
             .values()
             .filter(|row| row.builder_addr == builder_addr)
             .cloned()
             .collect();
+        let checkpoint_ts = inner
+            .checkpoints
+            .values()
+            .map(|checkpoint| checkpoint.last_processed_timestamp_us)
+            .max()
+            .unwrap_or_default();
+        drop(inner);
 
         if rows.is_empty() {
             return Ok(None);
@@ -183,7 +192,9 @@ impl StorageEngine for MemoryEngine {
             .map(|row| row.timestamp_us)
             .max()
             .unwrap_or_default();
+        let window_end_ts_us = checkpoint_ts.max(max_ts);
         let window_start_ts_us = max_ts
+            .max(window_end_ts_us)
             .saturating_sub(window.duration_us())
             .saturating_add(1);
         let mut trades = 0_u64;
@@ -211,6 +222,7 @@ impl StorageEngine for MemoryEngine {
             builder_addr: builder_addr.to_string(),
             window,
             window_start_ts_us,
+            window_end_ts_us,
             notional_volume: notional.to_string(),
             trades,
             active_accounts: accounts.len() as u64,
@@ -259,90 +271,99 @@ impl StorageEngine for MemoryEngine {
                 inner
                     .tx_by_version
                     .iter()
-                    .map(|(version, row)| (key::tx_by_version(*version), format!("{row:?}"))),
-            ),
+                    .map(|(version, row)| checksum_pair(key::tx_by_version(*version), row)),
+            )?,
             checksum_cf(
                 "cf_raw_event_by_version_idx",
                 inner
                     .events_by_version_idx
                     .iter()
                     .map(|((version, idx), row)| {
-                        (
-                            key::raw_event_by_version_idx(*version, *idx),
-                            format!("{row:?}"),
-                        )
+                        checksum_pair(key::raw_event_by_version_idx(*version, *idx), row)
                     }),
-            ),
+            )?,
             checksum_cf(
                 "cf_fills_by_market_time",
                 inner.fills_by_id.values().map(|row| {
-                    (
+                    checksum_pair(
                         key::fills_by_market_time(
                             &row.market_id,
                             row.timestamp_us,
                             row.version,
                             &row.fill_id,
                         ),
-                        format!("{row:?}"),
+                        row,
                     )
                 }),
-            ),
+            )?,
             checksum_cf(
                 "cf_fills_by_account_time",
                 inner.fills_by_id.values().map(|row| {
-                    (
+                    checksum_pair(
                         key::fills_by_account_time(
                             &row.account,
                             row.timestamp_us,
                             &row.market_id,
                             &row.fill_id,
                         ),
-                        format!("{row:?}"),
+                        row,
                     )
                 }),
-            ),
+            )?,
             checksum_cf(
                 "cf_order_by_id",
                 inner
                     .orders_by_id
                     .iter()
-                    .map(|(order_id, row)| (key::order_by_id(order_id), format!("{row:?}"))),
-            ),
+                    .map(|(order_id, row)| checksum_pair(key::order_by_id(order_id), row)),
+            )?,
             checksum_cf(
                 "cf_positions_by_account_market",
                 inner
                     .positions_by_account_market
                     .iter()
                     .map(|((account, market_id), row)| {
-                        (
-                            key::positions_by_account_market(account, market_id),
-                            format!("{row:?}"),
-                        )
+                        checksum_pair(key::positions_by_account_market(account, market_id), row)
                     }),
-            ),
+            )?,
             checksum_cf(
                 "cf_builder_code_fills",
                 inner.builder_attributions_by_fill.values().map(|row| {
-                    (
+                    checksum_pair(
                         key::builder_code_fills(
                             &row.builder_addr,
                             row.timestamp_us,
                             &row.market_id,
                             &row.fill_id,
                         ),
-                        format!("{row:?}"),
+                        row,
                     )
                 }),
-            ),
+            )?,
+            checksum_cf(
+                "cf_market_recent_activity",
+                inner.activities.iter().map(|row| {
+                    checksum_pair(
+                        key::market_activity(
+                            &row.market_id,
+                            row.timestamp_us,
+                            &row.activity_type,
+                            row.version,
+                            row.event_idx,
+                        ),
+                        row,
+                    )
+                }),
+            )?,
             checksum_cf(
                 "cf_ingest_checkpoint",
                 inner.checkpoints.values().map(|row| {
-                    (
+                    checksum_pair(
                         key::ingest_checkpoint(row.network, &row.package_address),
-                        format!("{row:?}"),
+                        row,
                     )
                 }),
-            ),
+            )?,
         ];
         Ok(checksums)
     }
@@ -380,52 +401,47 @@ fn checkpoint_key(checkpoint: &IngestCheckpoint) -> String {
     )
 }
 
-fn checksum_cf<I>(cf_name: &str, rows: I) -> CfChecksum
+fn checksum_pair<T: Serialize>(key: Vec<u8>, row: &T) -> Result<(Vec<u8>, Vec<u8>)> {
+    Ok((key, serde_json::to_vec(row).map_err(json_error)?))
+}
+
+fn json_error(error: serde_json::Error) -> HotIndexError {
+    HotIndexError::Parse(error.to_string())
+}
+
+fn checksum_cf<I>(cf_name: &str, rows: I) -> Result<CfChecksum>
 where
-    I: IntoIterator<Item = (Vec<u8>, String)>,
+    I: IntoIterator<Item = Result<(Vec<u8>, Vec<u8>)>>,
 {
-    let mut pairs: Vec<_> = rows.into_iter().collect();
+    let mut pairs: Vec<_> = rows.into_iter().collect::<Result<Vec<_>>>()?;
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let mut hash = StableHasher::default();
+    let mut hash = Sha256::new();
     for (key, value) in &pairs {
-        hash.update(key);
-        hash.update(&[0xff]);
-        hash.update(value.as_bytes());
-        hash.update(&[0xfe]);
+        update_checksum(&mut hash, key, value);
     }
 
-    CfChecksum {
+    Ok(CfChecksum {
         cf_name: cf_name.to_string(),
         row_count: pairs.len() as u64,
-        hash_hex: format!("{:016x}", hash.finish()),
-    }
+        hash_hex: hex_lower(&hash.finalize()),
+    })
 }
 
-#[derive(Debug, Clone)]
-struct StableHasher {
-    state: u64,
+fn update_checksum(hash: &mut Sha256, key: &[u8], value: &[u8]) {
+    hash.update((key.len() as u64).to_be_bytes());
+    hash.update(key);
+    hash.update((value.len() as u64).to_be_bytes());
+    hash.update(value);
 }
 
-impl Default for StableHasher {
-    fn default() -> Self {
-        Self {
-            state: 0xcbf2_9ce4_8422_2325,
-        }
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
     }
-}
-
-impl StableHasher {
-    fn update(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.state ^= u64::from(*byte);
-            self.state = self.state.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
-
-    fn finish(self) -> u64 {
-        self.state
-    }
+    out
 }
 
 #[derive(Debug, Default)]

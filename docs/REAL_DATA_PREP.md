@@ -68,11 +68,13 @@ Current `decibel-dataset record` is safe by default and only opens the live stre
 - uses Aptos `aptos-protos` generated client from the official `aptos-core` repository
 - writes length-delimited `Transaction` protobuf messages into `.pb.zst` chunks
 - supports `--resume`, `--transactions-count`, `--max-raw-bytes`, and bounded transaction chunks
+- supports tx-only protobuf normalization from a single chunk or a raw directory
+- supports RocksDB/ToplingDB import through `scripts/import-real-data.sh`
 
 Next implementation steps:
 
-- run a small auth/range smoke against mainnet Transaction Stream
-- keep retry/backoff and resume behavior deterministic
+- extract Decibel events from real protobuf `Transaction` messages
+- generate market/account/builder query corpora from parsed real events
 
 ## First Mainnet Smoke
 
@@ -102,13 +104,16 @@ rtk cargo run -p decibel-dataset -- record --live \
   --resume \
   --end-version 4381375638 \
   --max-raw-bytes 10GiB \
+  --max-stream-retries 10 \
   --chunk-transaction-count 100000 \
   --batch-size 500 \
   --out-dir <dataset>/raw \
   --raw-format protobuf-zstd
 ```
 
-If no checkpoint exists yet, replace `--resume` with `--start-version <version>`. After each completed chunk, `record_checkpoint.json` is updated. The next run can use `--resume` and will start from `next_start_version`.
+If no checkpoint exists yet, replace `--resume` with `--start-version <version>`. After each completed chunk, `record_checkpoint.json` is updated. The next run can use `--resume` and will start from `next_start_version`. Transient stream interruptions retry in-process by default; tune with `--max-stream-retries` and `--retry-backoff-ms`.
+
+For mainnet, the recorder rejects suspicious ranges such as a tiny `--start-version` with a multi-billion `--end-version`, because that usually means a cursor variable did not expand correctly.
 
 Raw decode check:
 
@@ -128,3 +133,26 @@ Expected result:
   "stopped_at_limit": false
 }
 ```
+
+## Import Into RocksDB/ToplingDB
+
+After raw chunks are downloaded under `<dataset>/raw`, import the transaction rows into RocksDB:
+
+```bash
+rtk ./scripts/import-real-data.sh rocksdb <dataset>
+```
+
+Import ToplingDB from the same normalized dataset:
+
+```bash
+export TOPLINGDB_EASY_MIGRATE_CONF=/path/to/topling_sui.yaml
+rtk ./scripts/import-real-data.sh toplingdb <dataset>
+```
+
+Or run both backends and compare checksums:
+
+```bash
+rtk ./scripts/import-real-data.sh both <dataset>
+```
+
+This is currently tx-only for real protobuf data: transaction rows are imported, while Decibel fills/orders/positions/builder rows stay empty until event extraction lands.

@@ -17,6 +17,23 @@ Aptos mainnet Transaction Stream
   -> REST API / benchmark runner / dashboard
 ```
 
+```mermaid
+flowchart TD
+  stream["Aptos Transaction Stream"] --> record["decibel-dataset record"]
+  record --> raw["Immutable raw archive (.pb.zst chunks)"]
+  raw --> normalize["decibel-dataset normalize"]
+  normalize --> rows["Normalized rows (tx rows now, Decibel events pending for protobuf)"]
+  rows --> corpus["build-query-corpus"]
+  rows --> replay["decibel-dataset replay"]
+  corpus --> bench["decibel-hotindex-bench"]
+  replay --> engine["StorageEngine trait"]
+  engine --> memory["MemoryEngine"]
+  engine --> rocks["RocksDbEngine"]
+  engine --> topling["ToplingDbEngine (native binding pending)"]
+  engine --> admin["decibel-admin checksums"]
+  engine --> api["REST API (M6)"]
+```
+
 ## Boundaries
 
 - `decibel-dataset` owns online recording, local normalization, query corpus generation, and replay.

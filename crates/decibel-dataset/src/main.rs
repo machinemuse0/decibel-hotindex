@@ -190,8 +190,8 @@ fn build_query_corpus_command(args: &[String]) -> Result<()> {
     let records = read_ndjson::<NormalizedEvent>(&events)?;
     if records.is_empty() {
         return Err(HotIndexError::Config(format!(
-            "no normalized events found in {}",
-            events.display()
+            "no normalized Decibel events found in {}; real Aptos protobuf normalization is currently tx-only, so use fixture/synthetic data for Decibel serving workloads until event extraction lands",
+            events.display(),
         )));
     }
 
@@ -1257,67 +1257,55 @@ impl RecordKeyWriter {
 }
 
 fn write_version_sample_file(path: &Path, versions: &[u64]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let file = File::create(path)?;
-    let mut writer = BufWriter::new(file);
-    for version in versions {
-        serde_json::to_writer(&mut writer, &serde_json::json!({ "version": version }))
-            .map_err(json_error)?;
-        writer.write_all(b"\n")?;
-    }
-    writer.flush()?;
-    Ok(())
+    atomic_write(path, |writer| {
+        for version in versions {
+            serde_json::to_writer(&mut *writer, &serde_json::json!({ "version": version }))
+                .map_err(json_error)?;
+            writer.write_all(b"\n")?;
+        }
+        Ok(())
+    })
 }
 
 fn write_point_tx_query_file(path: &Path, versions: &[u64]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let file = File::create(path)?;
-    let mut writer = BufWriter::new(file);
-    for version in versions {
-        let record = QueryCorpusRecord {
-            query_kind: QueryKind::GetTxByVersion,
-            tx_version: Some(*version),
-            tx_versions: Vec::new(),
-            market_id: None,
-            account: None,
-            builder_addr: None,
-            limit: None,
-        };
-        serde_json::to_writer(&mut writer, &record).map_err(json_error)?;
-        writer.write_all(b"\n")?;
-    }
-    writer.flush()?;
-    Ok(())
+    atomic_write(path, |writer| {
+        for version in versions {
+            let record = QueryCorpusRecord {
+                query_kind: QueryKind::GetTxByVersion,
+                tx_version: Some(*version),
+                tx_versions: Vec::new(),
+                market_id: None,
+                account: None,
+                builder_addr: None,
+                limit: None,
+            };
+            serde_json::to_writer(&mut *writer, &record).map_err(json_error)?;
+            writer.write_all(b"\n")?;
+        }
+        Ok(())
+    })
 }
 
 fn write_multi_get_tx_query_file(path: &Path, versions: &[u64], batch_size: usize) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let file = File::create(path)?;
-    let mut writer = BufWriter::new(file);
-    for chunk in versions
-        .chunks(batch_size)
-        .filter(|chunk| !chunk.is_empty())
-    {
-        let record = QueryCorpusRecord {
-            query_kind: QueryKind::MultiGetTxVersions,
-            tx_version: None,
-            tx_versions: chunk.to_vec(),
-            market_id: None,
-            account: None,
-            builder_addr: None,
-            limit: None,
-        };
-        serde_json::to_writer(&mut writer, &record).map_err(json_error)?;
-        writer.write_all(b"\n")?;
-    }
-    writer.flush()?;
-    Ok(())
+    atomic_write(path, |writer| {
+        for chunk in versions
+            .chunks(batch_size)
+            .filter(|chunk| !chunk.is_empty())
+        {
+            let record = QueryCorpusRecord {
+                query_kind: QueryKind::MultiGetTxVersions,
+                tx_version: None,
+                tx_versions: chunk.to_vec(),
+                market_id: None,
+                account: None,
+                builder_addr: None,
+                limit: None,
+            };
+            serde_json::to_writer(&mut *writer, &record).map_err(json_error)?;
+            writer.write_all(b"\n")?;
+        }
+        Ok(())
+    })
 }
 
 fn auth_token_present(opts: &Args<'_>) -> bool {
@@ -1386,7 +1374,7 @@ fn write_synthetic_dataset(root: &Path, dataset: &SyntheticDataset) -> Result<()
     )?;
     write_ndjson::<ActivityRow>(&normalized.join("activity_rows.ndjson"), &[])?;
     write_ndjson::<NormalizedEvent>(&normalized.join("unknown_events.ndjson"), &[])?;
-    fs::write(normalized.join("parse_warnings.log"), "")?;
+    write_text(&normalized.join("parse_warnings.log"), "")?;
 
     let corpus = build_query_corpus(&dataset.events);
     write_query_corpus_files(&queries, &corpus)?;
@@ -1471,13 +1459,42 @@ fn replay_into_engine<E: StorageEngine>(root: &Path, engine: &E) -> Result<()> {
         package_address: manifest.package_address,
         dataset_id: Some(manifest.dataset_id),
         last_processed_version: manifest.end_version.unwrap_or(manifest.start_version),
-        last_processed_timestamp_us: 0,
+        last_processed_timestamp_us: dataset_last_processed_timestamp_us(root)?,
         events_indexed: manifest.decibel_event_count,
         fills_indexed: manifest.fill_count,
         builder_attributions_indexed: manifest.builder_code_row_count,
     })?;
 
     Ok(())
+}
+
+fn dataset_last_processed_timestamp_us(root: &Path) -> Result<u64> {
+    let normalized = root.join("normalized");
+    let mut max_ts = 0_u64;
+
+    for row in read_ndjson::<TxRow>(&normalized.join("txs.ndjson"))? {
+        max_ts = max_ts.max(row.block_timestamp_us);
+    }
+    for row in read_ndjson::<NormalizedEvent>(&normalized.join("events.ndjson"))? {
+        max_ts = max_ts.max(row.block_timestamp_us);
+    }
+    for row in read_ndjson::<FillRow>(&normalized.join("fills.ndjson"))? {
+        max_ts = max_ts.max(row.timestamp_us);
+    }
+    for row in read_ndjson::<OrderRow>(&normalized.join("orders.ndjson"))? {
+        max_ts = max_ts.max(row.timestamp_us);
+    }
+    for row in read_ndjson::<PositionRow>(&normalized.join("positions.ndjson"))? {
+        max_ts = max_ts.max(row.timestamp_us);
+    }
+    for row in read_ndjson::<BuilderAttributionRow>(&normalized.join("builder_code_rows.ndjson"))? {
+        max_ts = max_ts.max(row.timestamp_us);
+    }
+    for row in read_ndjson::<ActivityRow>(&normalized.join("activity_rows.ndjson"))? {
+        max_ts = max_ts.max(row.timestamp_us);
+    }
+
+    Ok(max_ts)
 }
 
 fn print_replay_result<E: StorageEngine>(engine: &E) -> Result<()> {
@@ -1520,9 +1537,9 @@ fn write_normalized_fixture_dataset(
         &normalized_dir.join("unknown_events.ndjson"),
         &rows.unknown_events,
     )?;
-    fs::write(
-        normalized_dir.join("parse_warnings.log"),
-        rows.warnings.join("\n"),
+    write_text(
+        &normalized_dir.join("parse_warnings.log"),
+        &rows.warnings.join("\n"),
     )?;
 
     let mut hashes = BTreeMap::new();
@@ -1577,33 +1594,34 @@ fn normalize_protobuf_tx_only(
 
     fs::create_dir_all(normalized_dir)?;
     let txs_path = normalized_dir.join("txs.ndjson");
-    let mut tx_writer = BufWriter::new(File::create(&txs_path)?);
 
     let mut first_version = None;
     let mut last_version = None;
     let mut tx_count = 0_u64;
-    for raw_input in raw_inputs {
-        let mut decoder = zstd::stream::read::Decoder::new(File::open(raw_input)?)?;
-        while let Some(transaction) = read_next_len_delimited_transaction(&mut decoder)? {
-            if let Some(previous_version) = last_version {
-                if transaction.version <= previous_version {
-                    return Err(HotIndexError::Config(format!(
-                        "raw chunks are not strictly increasing: {} has version {} after {}",
-                        raw_input.display(),
-                        transaction.version,
-                        previous_version
-                    )));
+    atomic_write(&txs_path, |tx_writer| {
+        for raw_input in raw_inputs {
+            let mut decoder = zstd::stream::read::Decoder::new(File::open(raw_input)?)?;
+            while let Some(transaction) = read_next_len_delimited_transaction(&mut decoder)? {
+                if let Some(previous_version) = last_version {
+                    if transaction.version <= previous_version {
+                        return Err(HotIndexError::Config(format!(
+                            "raw chunks are not strictly increasing: {} has version {} after {}",
+                            raw_input.display(),
+                            transaction.version,
+                            previous_version
+                        )));
+                    }
                 }
+                first_version.get_or_insert(transaction.version);
+                last_version = Some(transaction.version);
+                let row = tx_row_from_transaction(&transaction, parser_options);
+                serde_json::to_writer(&mut *tx_writer, &row).map_err(json_error)?;
+                tx_writer.write_all(b"\n")?;
+                tx_count += 1;
             }
-            first_version.get_or_insert(transaction.version);
-            last_version = Some(transaction.version);
-            let row = tx_row_from_transaction(&transaction, parser_options);
-            serde_json::to_writer(&mut tx_writer, &row).map_err(json_error)?;
-            tx_writer.write_all(b"\n")?;
-            tx_count += 1;
         }
-    }
-    tx_writer.flush()?;
+        Ok(())
+    })?;
 
     write_ndjson::<NormalizedEvent>(&normalized_dir.join("events.ndjson"), &[])?;
     write_ndjson::<FillRow>(&normalized_dir.join("fills.ndjson"), &[])?;
@@ -1612,8 +1630,8 @@ fn normalize_protobuf_tx_only(
     write_ndjson::<BuilderAttributionRow>(&normalized_dir.join("builder_code_rows.ndjson"), &[])?;
     write_ndjson::<ActivityRow>(&normalized_dir.join("activity_rows.ndjson"), &[])?;
     write_ndjson::<NormalizedEvent>(&normalized_dir.join("unknown_events.ndjson"), &[])?;
-    fs::write(
-        normalized_dir.join("parse_warnings.log"),
+    write_text(
+        &normalized_dir.join("parse_warnings.log"),
         "tx-only protobuf normalization: Decibel event extraction is pending\n",
     )?;
 
@@ -2384,31 +2402,30 @@ fn parse_byte_size(value: &str, name: &str) -> Result<u64> {
 }
 
 fn write_ndjson<T: Serialize>(path: &Path, rows: &[T]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let file = File::create(path)?;
-    let mut writer = BufWriter::new(file);
-    for row in rows {
-        serde_json::to_writer(&mut writer, row).map_err(json_error)?;
-        writer.write_all(b"\n")?;
-    }
-    writer.flush()?;
-    Ok(())
+    atomic_write(path, |writer| {
+        for row in rows {
+            serde_json::to_writer(&mut *writer, row).map_err(json_error)?;
+            writer.write_all(b"\n")?;
+        }
+        Ok(())
+    })
 }
 
 fn write_jsonl_values(path: &Path, rows: &[serde_json::Value]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let file = File::create(path)?;
-    let mut writer = BufWriter::new(file);
-    for row in rows {
-        serde_json::to_writer(&mut writer, row).map_err(json_error)?;
-        writer.write_all(b"\n")?;
-    }
-    writer.flush()?;
-    Ok(())
+    atomic_write(path, |writer| {
+        for row in rows {
+            serde_json::to_writer(&mut *writer, row).map_err(json_error)?;
+            writer.write_all(b"\n")?;
+        }
+        Ok(())
+    })
+}
+
+fn write_text(path: &Path, value: &str) -> Result<()> {
+    atomic_write(path, |writer| {
+        writer.write_all(value.as_bytes())?;
+        Ok(())
+    })
 }
 
 fn read_ndjson<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
@@ -2449,11 +2466,44 @@ where
 }
 
 fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    atomic_write(path, |writer| {
+        serde_json::to_writer_pretty(&mut *writer, value).map_err(json_error)
+    })
+}
+
+fn atomic_write<F>(path: &Path, write: F) -> Result<()>
+where
+    F: FnOnce(&mut BufWriter<File>) -> Result<()>,
+{
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let file = File::create(path)?;
-    serde_json::to_writer_pretty(BufWriter::new(file), value).map_err(json_error)
+    let tmp_path = tmp_path_for(path)?;
+    let file = File::create(&tmp_path)?;
+    let mut writer = BufWriter::new(file);
+    write(&mut writer)?;
+    writer.flush()?;
+    let file = writer
+        .into_inner()
+        .map_err(|error| HotIndexError::Storage(error.to_string()))?;
+    file.sync_all()?;
+    fs::rename(&tmp_path, path)?;
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
+fn tmp_path_for(path: &Path) -> Result<PathBuf> {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err(HotIndexError::Config(format!(
+            "cannot build temp path for {}",
+            path.display()
+        )));
+    };
+    Ok(path.with_file_name(format!("{file_name}.tmp")))
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T> {
@@ -2740,7 +2790,7 @@ mod tests {
     fn record_checkpoint_accepts_token_from_env_name() {
         let root = temp_root("record-token-env");
         let _ = std::fs::remove_dir_all(&root);
-        let env_name = "DECIBEL_DATASET_TEST_AUTH_TOKEN";
+        let env_name = "DECIBEL_DATASET_TEST_AUTH_TOKEN_ENV_NAME";
         std::env::set_var(env_name, "secret-token-from-env");
         let args = vec![
             "--network".to_string(),

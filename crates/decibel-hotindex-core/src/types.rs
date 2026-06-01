@@ -232,6 +232,7 @@ pub struct BuilderVolumeRow {
     pub builder_addr: String,
     pub window: TimeWindow,
     pub window_start_ts_us: u64,
+    pub window_end_ts_us: u64,
     pub notional_volume: String,
     pub trades: u64,
     pub active_accounts: u64,

@@ -9,7 +9,8 @@ Current status:
   - range: `4365621793..4365622792`
   - decoded transactions: `1000`
   - remaining bytes after decode: `0`
-- Real Aptos protobuf `normalize` is not wired yet. Server runs should first collect immutable raw archives and verify decode. Normalized replay/benchmark against real raw data comes after the protobuf parser adapter is implemented.
+- Real Aptos protobuf tx-only `normalize` is wired. It materializes transaction rows for RocksDB/ToplingDB replay and point/multi-get benchmarks.
+- Decibel event extraction from real protobuf transactions is still pending, so fills/orders/positions/builder rows remain empty for real tx-only imports.
 
 ## 1. Server Prerequisites
 
@@ -185,7 +186,7 @@ If the previous run hit quota before completing, inspect the raw checkpoint firs
 rtk read "$DATASET_ROOT/raw/record_checkpoint.json"
 ```
 
-Use `next_start_version` for the next run. If there is no checkpoint but a large `transactions_*.pb.zst.tmp` exists, decode that tmp file with `inspect-raw --allow-truncated` and resume from `next_start_version`:
+Use `next_start_version` for the next run. If there is no checkpoint but completed `transactions_*.pb.zst` chunks exist, `--resume` can infer the cursor from their filenames. If only a large `transactions_*.pb.zst.tmp` exists, decode that tmp file with `inspect-raw --allow-truncated` and resume from `next_start_version`:
 
 ```bash
 rtk cargo run -p decibel-dataset -- inspect-raw \
@@ -206,6 +207,7 @@ rtk cargo run -p decibel-dataset -- record \
   --resume \
   --end-version "$END_VERSION" \
   --max-raw-bytes 10GiB \
+  --max-stream-retries 10 \
   --chunk-transaction-count 100000 \
   --batch-size 500 \
   --key-sample-limit 1000000 \
@@ -213,7 +215,15 @@ rtk cargo run -p decibel-dataset -- record \
   --raw-format protobuf-zstd
 ```
 
-If no usable checkpoint exists, set `--start-version <last_version_plus_1>` instead of `--resume`. The recorder writes `last_success_version` and `next_start_version` after every completed chunk, so later quota stops are resumable.
+If no usable checkpoint exists, set `--start-version <last_version_plus_1>` instead of `--resume`. The recorder writes `last_success_version` and `next_start_version` after every completed chunk, so later quota stops are resumable. Transient stream interruptions retry in the same process by default; increase `--max-stream-retries` for long pulls.
+
+Sanity check the cursor before starting a quota-sized run:
+
+```bash
+test "$NEXT_START_VERSION" -ge "$START_VERSION"
+```
+
+The recorder also rejects suspicious mainnet ranges where `--start-version` is tiny but `--end-version` is in the billions. That usually means the cursor variable did not expand correctly.
 
 The recorder also writes benchmark key artifacts while streaming:
 
@@ -233,16 +243,30 @@ Notes:
 
 ## 6. RocksDB Baseline
 
-RocksDB is already wired. For fixture/synthetic datasets:
+RocksDB is already wired. For fixture/synthetic and real tx-only datasets:
 
 ```bash
 rtk cargo check -p decibel-hotindex-storage --features rocksdb
 rtk cargo test -p decibel-hotindex-storage --features rocksdb
 ```
 
-Replay after normalized real-data support is wired:
+Import downloaded raw chunks into RocksDB:
 
 ```bash
+rtk ./scripts/import-real-data.sh rocksdb "$DATASET_ROOT"
+```
+
+The script normalizes `$DATASET_ROOT/raw/transactions_*.pb.zst` into tx-only normalized artifacts, replays them into `$DATASET_ROOT/materialized/rocksdb`, and writes `$DATASET_ROOT/reports/rocksdb-checksums.json`.
+
+Manual equivalent:
+
+```bash
+rtk cargo run -p decibel-dataset -- normalize \
+  --input "$DATASET_ROOT/raw" \
+  --out-dir "$DATASET_ROOT/normalized" \
+  --format protobuf-zstd \
+  --network mainnet
+
 rtk cargo run -p decibel-dataset --features rocksdb -- replay \
   --dataset "$DATASET_ROOT" \
   --engine rocksdb \
@@ -305,7 +329,21 @@ rtk cargo check -p decibel-admin --features toplingsdb
 rtk cargo check -p decibel-hotindex-bench --features toplingsdb
 ```
 
-ToplingDB replay after normalized real-data support is wired:
+ToplingDB import:
+
+```bash
+rtk ./scripts/import-real-data.sh toplingdb "$DATASET_ROOT" \
+  --toplingdb-conf "$TOPLINGDB_EASY_MIGRATE_CONF"
+```
+
+To import both backends and compare checksums:
+
+```bash
+rtk ./scripts/import-real-data.sh both "$DATASET_ROOT" \
+  --toplingdb-conf "$TOPLINGDB_EASY_MIGRATE_CONF"
+```
+
+Manual ToplingDB replay:
 
 ```bash
 rtk cargo run -p decibel-dataset --features toplingsdb -- replay \
@@ -373,10 +411,9 @@ rtk cargo run -p decibel-hotindex-bench -- summarize \
 
 ## 9. Current Blocking Item
 
-The live raw archive path is ready. The remaining blocker before real-data RocksDB/ToplingDB materialization is:
+The live raw archive path and tx-only RocksDB/ToplingDB materialization are ready. The remaining blocker before full Decibel workload benchmarks is:
 
-- implement `normalize` for Aptos Transaction protobuf `.pb.zst` chunks
 - extract Decibel events from real `Transaction` messages
-- generate manifest/query corpus from the normalized real rows
+- generate market/account/builder query corpora from normalized real Decibel rows
 
-Until then, server work should focus on collecting and verifying raw archives, plus compiling the ToplingDB worktree.
+Until then, server work can collect raw archives, import tx rows into both backends, run checksum comparison, and use tx point/multi-get query files for smoke benchmarks.

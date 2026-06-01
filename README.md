@@ -22,9 +22,12 @@ Milestone 4 is in progress:
 - feature-gated RocksDB backend implementation
 - feature-gated ToplingDB stub
 - admin checksum / compare-checksum commands
-- mainnet raw archive format: length-delimited Aptos Transaction protobuf + zstd
-- RocksDB/ToplingDB replay from the same saved dataset
-- benchmark runner must remain offline-only
+- mainnet raw archive recording: length-delimited Aptos Transaction protobuf + zstd
+- mainnet protobuf normalization: tx rows only; Decibel event extraction is pending
+- RocksDB replay from the same saved dataset
+- ToplingDB native binding: pending; do not publish RocksDB vs ToplingDB numbers yet
+- REST API: not started (M6)
+- benchmark runner: offline smoke/CI only until methodology hardening lands
 
 ## Workspace
 

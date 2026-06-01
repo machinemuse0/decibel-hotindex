@@ -8,6 +8,7 @@ use decibel_hotindex_core::{
 use rocksdb::{ColumnFamilyDescriptor, Direction, IteratorMode, Options, DB};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -29,6 +30,7 @@ const LOGICAL_CFS: &[&str] = &[
     CF_ORDER_BY_ID,
     CF_POSITIONS_BY_ACCOUNT_MARKET,
     CF_BUILDER_CODE_FILLS,
+    CF_MARKET_RECENT_ACTIVITY,
     CF_INGEST_CHECKPOINT,
 ];
 
@@ -110,14 +112,32 @@ impl RocksDbEngine {
         Ok(rows)
     }
 
-    fn cf_len(&self, cf_name: &str) -> Result<u64> {
+    fn cf_estimated_len(&self, cf_name: &str) -> Result<u64> {
         let cf = self.cf(cf_name)?;
-        let mut count = 0_u64;
+        let Some(value) = self
+            .db
+            .property_value_cf(cf, "rocksdb.estimate-num-keys")
+            .map_err(rocks_error)?
+        else {
+            return Ok(0);
+        };
+        value.parse::<u64>().map_err(|error| {
+            HotIndexError::Storage(format!(
+                "invalid RocksDB estimate-num-keys for {cf_name}: {value}: {error}"
+            ))
+        })
+    }
+
+    fn latest_checkpoint_timestamp_us(&self) -> Result<u64> {
+        let cf = self.cf(CF_INGEST_CHECKPOINT)?;
+        let mut max_ts = 0_u64;
         for item in self.db.iterator_cf(cf, IteratorMode::Start) {
-            item.map_err(rocks_error)?;
-            count += 1;
+            let (_, value) = item.map_err(rocks_error)?;
+            let checkpoint =
+                serde_json::from_slice::<IngestCheckpoint>(&value).map_err(json_error)?;
+            max_ts = max_ts.max(checkpoint.last_processed_timestamp_us);
         }
-        Ok(count)
+        Ok(max_ts)
     }
 }
 
@@ -218,9 +238,21 @@ impl StorageEngine for RocksDbEngine {
     }
 
     fn multi_get_txs(&self, versions: &[u64]) -> Result<Vec<Option<TxRow>>> {
-        versions
+        let cf = self.cf(CF_TX_BY_VERSION)?;
+        let keys = versions
             .iter()
-            .map(|version| self.get_tx(*version))
+            .map(|version| key::tx_by_version(*version))
+            .collect::<Vec<_>>();
+
+        self.db
+            .batched_multi_get_cf(cf, keys.iter(), false)
+            .into_iter()
+            .map(|result| {
+                result
+                    .map_err(rocks_error)?
+                    .map(|value| serde_json::from_slice(&value).map_err(json_error))
+                    .transpose()
+            })
             .collect()
     }
 
@@ -279,7 +311,9 @@ impl StorageEngine for RocksDbEngine {
             .map(|row| row.timestamp_us)
             .max()
             .unwrap_or_default();
+        let window_end_ts_us = self.latest_checkpoint_timestamp_us()?.max(max_ts);
         let window_start_ts_us = max_ts
+            .max(window_end_ts_us)
             .saturating_sub(window.duration_us())
             .saturating_add(1);
         let mut trades = 0_u64;
@@ -307,6 +341,7 @@ impl StorageEngine for RocksDbEngine {
             builder_addr: builder_addr.to_string(),
             window,
             window_start_ts_us,
+            window_end_ts_us,
             notional_volume: notional.to_string(),
             trades,
             active_accounts: accounts.len() as u64,
@@ -326,13 +361,13 @@ impl StorageEngine for RocksDbEngine {
 
     fn stats(&self) -> Result<StorageStats> {
         Ok(StorageStats {
-            tx_count: self.cf_len(CF_TX_BY_VERSION)?,
-            event_count: self.cf_len(CF_RAW_EVENT_BY_VERSION_IDX)?,
-            fill_count: self.cf_len(CF_FILLS_BY_MARKET_TIME)?,
-            order_count: self.cf_len(CF_ORDER_BY_ID)?,
-            position_count: self.cf_len(CF_POSITIONS_BY_ACCOUNT_MARKET)?,
-            builder_attribution_count: self.cf_len(CF_BUILDER_CODE_FILLS)?,
-            checkpoint_count: self.cf_len(CF_INGEST_CHECKPOINT)?,
+            tx_count: self.cf_estimated_len(CF_TX_BY_VERSION)?,
+            event_count: self.cf_estimated_len(CF_RAW_EVENT_BY_VERSION_IDX)?,
+            fill_count: self.cf_estimated_len(CF_FILLS_BY_MARKET_TIME)?,
+            order_count: self.cf_estimated_len(CF_ORDER_BY_ID)?,
+            position_count: self.cf_estimated_len(CF_POSITIONS_BY_ACCOUNT_MARKET)?,
+            builder_attribution_count: self.cf_estimated_len(CF_BUILDER_CODE_FILLS)?,
+            checkpoint_count: self.cf_estimated_len(CF_INGEST_CHECKPOINT)?,
         })
     }
 
@@ -346,59 +381,20 @@ impl StorageEngine for RocksDbEngine {
 
 fn checksum_cf(engine: &RocksDbEngine, cf_name: &str) -> Result<CfChecksum> {
     let cf = engine.cf(cf_name)?;
-    let mut hash = StableHasher::default();
+    let mut hash = Sha256::new();
     let mut row_count = 0_u64;
 
     for item in engine.db.iterator_cf(cf, IteratorMode::Start) {
         let (key, value) = item.map_err(rocks_error)?;
-        hash.update(&key);
-        hash.update(&[0xff]);
-        hash.update(debug_value(cf_name, &value)?.as_bytes());
-        hash.update(&[0xfe]);
+        update_checksum(&mut hash, &key, &value);
         row_count += 1;
     }
 
     Ok(CfChecksum {
         cf_name: cf_name.to_string(),
         row_count,
-        hash_hex: format!("{:016x}", hash.finish()),
+        hash_hex: hex_lower(&hash.finalize()),
     })
-}
-
-fn debug_value(cf_name: &str, value: &[u8]) -> Result<String> {
-    match cf_name {
-        CF_TX_BY_VERSION => Ok(format!(
-            "{:?}",
-            serde_json::from_slice::<TxRow>(value).map_err(json_error)?
-        )),
-        CF_RAW_EVENT_BY_VERSION_IDX => Ok(format!(
-            "{:?}",
-            serde_json::from_slice::<NormalizedEvent>(value).map_err(json_error)?
-        )),
-        CF_FILLS_BY_MARKET_TIME | CF_FILLS_BY_ACCOUNT_TIME => Ok(format!(
-            "{:?}",
-            serde_json::from_slice::<FillRow>(value).map_err(json_error)?
-        )),
-        CF_ORDER_BY_ID => Ok(format!(
-            "{:?}",
-            serde_json::from_slice::<OrderRow>(value).map_err(json_error)?
-        )),
-        CF_POSITIONS_BY_ACCOUNT_MARKET => Ok(format!(
-            "{:?}",
-            serde_json::from_slice::<PositionRow>(value).map_err(json_error)?
-        )),
-        CF_BUILDER_CODE_FILLS => Ok(format!(
-            "{:?}",
-            serde_json::from_slice::<BuilderAttributionRow>(value).map_err(json_error)?
-        )),
-        CF_INGEST_CHECKPOINT => Ok(format!(
-            "{:?}",
-            serde_json::from_slice::<IngestCheckpoint>(value).map_err(json_error)?
-        )),
-        other => Err(HotIndexError::Storage(format!(
-            "unsupported checksum column family {other}"
-        ))),
-    }
 }
 
 fn rocks_error(error: rocksdb::Error) -> HotIndexError {
@@ -409,30 +405,20 @@ fn json_error(error: serde_json::Error) -> HotIndexError {
     HotIndexError::Parse(error.to_string())
 }
 
-#[derive(Debug, Clone)]
-struct StableHasher {
-    state: u64,
+fn update_checksum(hash: &mut Sha256, key: &[u8], value: &[u8]) {
+    hash.update((key.len() as u64).to_be_bytes());
+    hash.update(key);
+    hash.update((value.len() as u64).to_be_bytes());
+    hash.update(value);
 }
 
-impl Default for StableHasher {
-    fn default() -> Self {
-        Self {
-            state: 0xcbf2_9ce4_8422_2325,
-        }
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
     }
-}
-
-impl StableHasher {
-    fn update(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.state ^= u64::from(*byte);
-            self.state = self.state.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
-
-    fn finish(self) -> u64 {
-        self.state
-    }
+    out
 }
 
 #[derive(Debug, Default)]

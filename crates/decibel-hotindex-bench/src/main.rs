@@ -179,19 +179,19 @@ fn run_serving_bench(
     manifest: &DatasetManifest,
     started_at: &str,
 ) -> Result<BenchmarkReport> {
+    ensure_serving_workload_supported(manifest, workload)?;
     let query_corpus = query_corpus_report(dataset, workload)?;
     let corpus = read_ndjson(&query_corpus.path)?;
     if corpus.is_empty() {
-        return Err(HotIndexError::Config(format!(
-            "query corpus for workload {workload} is empty"
-        )));
+        return Err(empty_corpus_error(manifest, workload));
     }
 
     match backend {
         "memory" => {
             let engine = MemoryEngine::default();
             replay_into_engine(dataset, &engine)?;
-            let result = measure_queries(&engine, &corpus, iterations, warmup);
+            let result =
+                measure_queries(&engine, &corpus, iterations, warmup, access_pattern, seed)?;
             build_report(
                 manifest,
                 dataset,
@@ -246,6 +246,27 @@ fn run_serving_bench(
     }
 }
 
+fn ensure_serving_workload_supported(manifest: &DatasetManifest, workload: &str) -> Result<()> {
+    if manifest.decibel_event_count == 0 && requires_decibel_events(workload) {
+        return Err(empty_corpus_error(manifest, workload));
+    }
+    Ok(())
+}
+
+fn requires_decibel_events(workload: &str) -> bool {
+    !matches!(workload, "get_tx_by_version" | "multi_get_tx_versions_100")
+}
+
+fn empty_corpus_error(manifest: &DatasetManifest, workload: &str) -> HotIndexError {
+    if manifest.decibel_event_count == 0 && requires_decibel_events(workload) {
+        HotIndexError::Config(format!(
+            "workload {workload} requires Decibel events, but this dataset has decibel_event_count=0; real Aptos protobuf normalization is currently tx-only, so use fixture/synthetic data or run tx point/multi-get workloads until event extraction lands"
+        ))
+    } else {
+        HotIndexError::Config(format!("query corpus for workload {workload} is empty"))
+    }
+}
+
 #[cfg(feature = "rocksdb")]
 fn run_rocksdb_serving(
     dataset: &Path,
@@ -264,7 +285,7 @@ fn run_rocksdb_serving(
 ) -> Result<BenchmarkReport> {
     let path = db_path.unwrap_or_else(|| dataset.join("materialized/rocksdb"));
     let engine = RocksDbEngine::open(&path)?;
-    let result = measure_queries(&engine, &corpus, iterations, warmup);
+    let result = measure_queries(&engine, &corpus, iterations, warmup, access_pattern, seed)?;
     build_report(
         manifest,
         dataset,
@@ -323,7 +344,7 @@ fn run_toplingdb_serving(
 ) -> Result<BenchmarkReport> {
     let path = db_path.unwrap_or_else(|| dataset.join("materialized/toplingdb"));
     let engine = ToplingDbEngine::open(&path)?;
-    let result = measure_queries(&engine, &corpus, iterations, warmup);
+    let result = measure_queries(&engine, &corpus, iterations, warmup, access_pattern, seed)?;
     build_report(
         manifest,
         dataset,
@@ -551,7 +572,15 @@ fn run_read_under_ingest_bench(
     match backend {
         "memory" => {
             let engine = MemoryEngine::default();
-            let result = measure_read_under_ingest(&engine, &rows, &corpus, iterations, warmup)?;
+            let result = measure_read_under_ingest(
+                &engine,
+                &rows,
+                &corpus,
+                iterations,
+                warmup,
+                access_pattern,
+                seed,
+            )?;
             put_checkpoint_from_manifest(dataset, &engine)?;
             build_report(
                 manifest,
@@ -628,7 +657,15 @@ fn run_toplingdb_read_under_ingest(
 ) -> Result<BenchmarkReport> {
     let path = db_path.unwrap_or_else(|| dataset.join("materialized/toplingdb-bench-read-ingest"));
     let engine = ToplingDbEngine::open(path)?;
-    let result = measure_read_under_ingest(&engine, &rows, &corpus, iterations, warmup)?;
+    let result = measure_read_under_ingest(
+        &engine,
+        &rows,
+        &corpus,
+        iterations,
+        warmup,
+        access_pattern,
+        seed,
+    )?;
     put_checkpoint_from_manifest(dataset, &engine)?;
     build_report(
         manifest,
@@ -691,7 +728,15 @@ fn run_rocksdb_read_under_ingest(
 ) -> Result<BenchmarkReport> {
     let path = db_path.unwrap_or_else(|| dataset.join("materialized/rocksdb-bench-read-ingest"));
     let engine = RocksDbEngine::open(path)?;
-    let result = measure_read_under_ingest(&engine, &rows, &corpus, iterations, warmup)?;
+    let result = measure_read_under_ingest(
+        &engine,
+        &rows,
+        &corpus,
+        iterations,
+        warmup,
+        access_pattern,
+        seed,
+    )?;
     put_checkpoint_from_manifest(dataset, &engine)?;
     build_report(
         manifest,
@@ -740,23 +785,99 @@ fn measure_queries<E: StorageEngine>(
     corpus: &[QueryCorpusRecord],
     iterations: usize,
     warmup: usize,
-) -> BenchResult {
+    access_pattern: &str,
+    seed: &str,
+) -> Result<BenchResult> {
+    validate_access_pattern(access_pattern)?;
+    let mut rng = DeterministicRng::new(seed_from_string(seed));
     for idx in 0..warmup {
-        let _ = execute_query(engine, &corpus[idx % corpus.len()]);
+        let record_idx = query_index(access_pattern, idx, corpus.len(), &mut rng);
+        let _ = execute_query(engine, &corpus[record_idx]);
     }
 
     let mut latencies = Vec::with_capacity(iterations);
     let mut errors = 0_u64;
     let started = Instant::now();
     for idx in 0..iterations {
-        let record = &corpus[idx % corpus.len()];
+        let record_idx = query_index(access_pattern, idx, corpus.len(), &mut rng);
+        let record = &corpus[record_idx];
         let op_started = Instant::now();
         if execute_query(engine, record).is_err() {
             errors += 1;
         }
         latencies.push(op_started.elapsed().as_micros() as u64);
     }
-    finish_result(iterations as u64, errors, started.elapsed(), latencies)
+    Ok(finish_result(
+        iterations as u64,
+        errors,
+        started.elapsed(),
+        latencies,
+    ))
+}
+
+fn validate_access_pattern(access_pattern: &str) -> Result<()> {
+    match access_pattern {
+        "sequential" | "uniform" | "zipfian" => Ok(()),
+        other => Err(HotIndexError::Config(format!(
+            "unsupported access pattern: {other}; expected sequential, uniform, or zipfian"
+        ))),
+    }
+}
+
+fn query_index(
+    access_pattern: &str,
+    sequential_idx: usize,
+    corpus_len: usize,
+    rng: &mut DeterministicRng,
+) -> usize {
+    match access_pattern {
+        "uniform" => rng.next_usize(corpus_len),
+        "zipfian" => rng.next_zipf_like(corpus_len),
+        _ => sequential_idx % corpus_len,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DeterministicRng {
+    state: u64,
+}
+
+impl DeterministicRng {
+    fn new(seed: u64) -> Self {
+        Self { state: seed.max(1) }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self
+            .state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        self.state
+    }
+
+    fn next_usize(&mut self, upper: usize) -> usize {
+        if upper <= 1 {
+            return 0;
+        }
+        (self.next_u64() as usize) % upper
+    }
+
+    fn next_zipf_like(&mut self, upper: usize) -> usize {
+        if upper <= 1 {
+            return 0;
+        }
+        let unit = ((self.next_u64() >> 11) as f64) / ((1_u64 << 53) as f64);
+        let skewed = unit * unit * unit;
+        ((skewed * upper as f64) as usize).min(upper - 1)
+    }
+}
+
+fn seed_from_string(seed: &str) -> u64 {
+    seed.as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |state, byte| {
+            (state ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
 }
 
 fn execute_query<E: StorageEngine>(engine: &E, record: &QueryCorpusRecord) -> Result<()> {
@@ -828,10 +949,12 @@ fn measure_read_under_ingest<E: StorageEngine>(
     corpus: &[QueryCorpusRecord],
     iterations: usize,
     warmup: usize,
+    access_pattern: &str,
+    seed: &str,
 ) -> Result<BenchResult> {
     std::thread::scope(|scope| {
         let ingest = scope.spawn(|| rows.replay_limit(engine, rows.total_rows()));
-        let result = measure_queries(engine, corpus, iterations, warmup);
+        let result = measure_queries(engine, corpus, iterations, warmup, access_pattern, seed)?;
         ingest.join().map_err(|_| {
             HotIndexError::Storage("background ingest thread panicked".to_string())
         })??;
@@ -887,12 +1010,41 @@ fn put_checkpoint_from_manifest<E: StorageEngine>(root: &Path, engine: &E) -> Re
         package_address: manifest.package_address,
         dataset_id: Some(manifest.dataset_id),
         last_processed_version: manifest.end_version.unwrap_or(manifest.start_version),
-        last_processed_timestamp_us: 0,
+        last_processed_timestamp_us: dataset_last_processed_timestamp_us(root)?,
         events_indexed: manifest.decibel_event_count,
         fills_indexed: manifest.fill_count,
         builder_attributions_indexed: manifest.builder_code_row_count,
     })?;
     Ok(())
+}
+
+fn dataset_last_processed_timestamp_us(root: &Path) -> Result<u64> {
+    let normalized = root.join("normalized");
+    let mut max_ts = 0_u64;
+
+    for row in read_ndjson::<TxRow>(&normalized.join("txs.ndjson"))? {
+        max_ts = max_ts.max(row.block_timestamp_us);
+    }
+    for row in read_ndjson::<NormalizedEvent>(&normalized.join("events.ndjson"))? {
+        max_ts = max_ts.max(row.block_timestamp_us);
+    }
+    for row in read_ndjson::<FillRow>(&normalized.join("fills.ndjson"))? {
+        max_ts = max_ts.max(row.timestamp_us);
+    }
+    for row in read_ndjson::<OrderRow>(&normalized.join("orders.ndjson"))? {
+        max_ts = max_ts.max(row.timestamp_us);
+    }
+    for row in read_ndjson::<PositionRow>(&normalized.join("positions.ndjson"))? {
+        max_ts = max_ts.max(row.timestamp_us);
+    }
+    for row in read_ndjson::<BuilderAttributionRow>(&normalized.join("builder_code_rows.ndjson"))? {
+        max_ts = max_ts.max(row.timestamp_us);
+    }
+    for row in read_ndjson::<ActivityRow>(&normalized.join("activity_rows.ndjson"))? {
+        max_ts = max_ts.max(row.timestamp_us);
+    }
+
+    Ok(max_ts)
 }
 
 struct IngestRows {
@@ -1011,6 +1163,7 @@ fn build_report(
     Ok(BenchmarkReport {
         report_version: 1,
         started_at: started_at.to_string(),
+        methodology_status: "engineering_smoke_not_publishable".to_string(),
         benchmark_class: benchmark_class.to_string(),
         backend: backend.to_string(),
         workload: workload.to_string(),
@@ -1033,9 +1186,7 @@ fn build_report(
         checksum,
         environment: EnvironmentReport::capture(dataset),
         result,
-        disclaimer:
-            "same schema, same dataset, same keyset, same workload; preliminary engineering benchmark"
-                .to_string(),
+        disclaimer: "engineering smoke benchmark only; not publishable methodology until HDR/open-loop/concurrency/env fingerprint hardening lands".to_string(),
     })
 }
 
@@ -1065,6 +1216,8 @@ fn build_checksum_report(
 struct BenchmarkReport {
     report_version: u32,
     started_at: String,
+    #[serde(default)]
+    methodology_status: String,
     benchmark_class: String,
     backend: String,
     workload: String,
@@ -1120,7 +1273,18 @@ struct EnvironmentReport {
 impl EnvironmentReport {
     fn capture(dataset: &Path) -> Self {
         let mut env = BTreeMap::new();
-        env.insert("rust_profile".to_string(), "dev".to_string());
+        env.insert(
+            "rust_profile".to_string(),
+            if cfg!(debug_assertions) {
+                "debug".to_string()
+            } else {
+                "release".to_string()
+            },
+        );
+        env.insert(
+            "bench_crate_version".to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        );
         Self {
             os: env::consts::OS.to_string(),
             arch: env::consts::ARCH.to_string(),
@@ -1255,8 +1419,8 @@ impl<'a> Args<'a> {
 fn print_usage() {
     eprintln!(
         "usage:
-  decibel-hotindex-bench run --dataset <dataset-dir> --engine memory --class serving --workload mixed_market_dashboard --iterations <n> --warmup <n> --out <report.json>
-  decibel-hotindex-bench run --features rocksdb --dataset <dataset-dir> --engine rocksdb --db-path <rocksdb-path> --class serving --workload mixed_market_dashboard --iterations <n> --warmup <n> --out <report.json>
+  decibel-hotindex-bench run --dataset <dataset-dir> --engine memory --class serving --workload mixed_market_dashboard --iterations <n> --warmup <n> --access-pattern sequential|uniform|zipfian --seed <seed> --out <report.json>
+  decibel-hotindex-bench run --features rocksdb --dataset <dataset-dir> --engine rocksdb --db-path <rocksdb-path> --class serving --workload mixed_market_dashboard --iterations <n> --warmup <n> --access-pattern sequential|uniform|zipfian --seed <seed> --out <report.json>
   decibel-hotindex-bench run --dataset <dataset-dir> --engine memory --class ingest --iterations <n> --warmup <n> --out <report.json>
   decibel-hotindex-bench summarize --reports <report-a.json,report-b.json> --out reports/BENCHMARK_SUMMARY.md"
     );
@@ -1288,6 +1452,13 @@ fn write_markdown_summary(path: &Path, reports: &[BenchmarkReport]) -> Result<()
     ));
     text.push_str(&format!("- query_corpus: {query_corpus}\n"));
     text.push_str(&format!(
+        "- methodology_status: {}\n",
+        non_empty(
+            &first.methodology_status,
+            "engineering_smoke_not_publishable"
+        )
+    ));
+    text.push_str(&format!(
         "- checksum_status: {}\n",
         checksum_status_summary(reports)
     ));
@@ -1298,7 +1469,9 @@ fn write_markdown_summary(path: &Path, reports: &[BenchmarkReport]) -> Result<()
         first.environment.cpu_parallelism,
         first.environment.storage_path
     ));
-    text.push_str("- disclaimer: same schema, same dataset, same keyset, same workload\n\n");
+    text.push_str(
+        "- disclaimer: engineering smoke benchmark only; not publishable methodology\n\n",
+    );
     text.push_str("| class | backend | workload | ops | errors | qps | p50_us | p95_us | p99_us | p999_us | checksum |\n");
     text.push_str("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n");
     for report in reports {
@@ -1328,6 +1501,14 @@ fn write_markdown_summary(path: &Path, reports: &[BenchmarkReport]) -> Result<()
     }
     std::fs::write(path, text)?;
     Ok(())
+}
+
+fn non_empty<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    if value.is_empty() {
+        fallback
+    } else {
+        value
+    }
 }
 
 fn checksum_status_summary(reports: &[BenchmarkReport]) -> String {
