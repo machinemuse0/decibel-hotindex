@@ -2,6 +2,8 @@
 
 Real benchmark data should be recorded from Aptos mainnet once, stored as immutable raw artifacts, then replayed locally into every backend. Benchmark commands must never call Aptos gRPC.
 
+RocksDB and ToplingDB runs must use separate worktrees. See [Backend Worktrees](BACKEND_WORKTREES.md) for the canonical build/import/benchmark flow.
+
 ## Auth
 
 Use a local environment variable for the Geomi/Aptos API key:
@@ -32,7 +34,8 @@ decibel-dataset record mainnet once
   -> manifest sha256 + record checkpoint
   -> decibel-dataset normalize
   -> decibel-dataset build-query-corpus
-  -> decibel-dataset replay memory/rocksdb/toplingdb
+  -> decibel-dataset replay memory/rocksdb from main
+  -> decibel-dataset replay memory/toplingdb from topingdb
   -> decibel-admin checksum
   -> decibel-hotindex-bench run
 ```
@@ -69,7 +72,7 @@ Current `decibel-dataset record` is safe by default and only opens the live stre
 - writes length-delimited `Transaction` protobuf messages into `.pb.zst` chunks
 - supports `--resume`, `--transactions-count`, `--max-raw-bytes`, and bounded transaction chunks
 - supports tx-only protobuf normalization from a single chunk or a raw directory
-- supports RocksDB/ToplingDB import through `scripts/import-real-data.sh`
+- supports RocksDB import in `main` and ToplingDB import in the dedicated `topingdb` worktree
 
 Next implementation steps:
 
@@ -134,28 +137,36 @@ Expected result:
 }
 ```
 
-## Import Into RocksDB/ToplingDB
+## Import Into RocksDB/ToplingDB Worktrees
 
-After raw chunks are downloaded under `<dataset>/raw`, import the transaction rows into RocksDB:
+After raw chunks are downloaded under `<dataset>/raw`, import the transaction rows into RocksDB from the clean `main` worktree:
 
 ```bash
-rtk cargo build -p decibel-dataset -p decibel-admin --features rocksdb --release
-rtk ./scripts/import-real-data.sh rocksdb <dataset> --bin-dir target/release
+rtk ./scripts/check-backend-isolation.sh rocksdb
+rtk cargo build -p decibel-dataset -p decibel-admin --features rocksdb --release --target-dir target/rocksdb
+rtk ./scripts/import-real-data.sh rocksdb <dataset> --bin-dir target/rocksdb/release
 ```
 
-Import ToplingDB from the same normalized dataset:
+Import ToplingDB from the separate `topingdb` worktree:
 
 ```bash
+cd /Users/ssyuan/work/project/decibel-hotindex-topingdb
 export TOPLINGDB_EASY_MIGRATE_CONF=/path/to/topling_sui.yaml
-rtk cargo build -p decibel-dataset -p decibel-admin --features toplingsdb --release
-rtk ./scripts/import-real-data.sh toplingdb <dataset> --bin-dir target/release
+rtk ./scripts/check-backend-isolation.sh toplingdb
+rtk cargo build -p decibel-dataset -p decibel-admin --features toplingsdb --release --target-dir target/topingdb
+rtk ./scripts/import-real-data.sh toplingdb <dataset> \
+  --bin-dir target/topingdb/release \
+  --toplingdb-conf "$TOPLINGDB_EASY_MIGRATE_CONF"
 ```
 
-Or run both backends and compare checksums:
+For RocksDB vs ToplingDB comparison, use the checksum files produced by those isolated imports:
 
 ```bash
-rtk cargo build -p decibel-dataset -p decibel-admin --features toplingsdb --release
-rtk ./scripts/import-real-data.sh both <dataset> --bin-dir target/release
+rtk cargo run -p decibel-admin -- compare-checksum \
+  --left <dataset>/reports/rocksdb-checksums.json \
+  --right <dataset>/reports/toplingdb-checksums.json
 ```
+
+The import scripts intentionally have no `both` mode. Keep RocksDB and ToplingDB imports separate so `TOPLINGDB_EASY_MIGRATE_CONF` and patched `rocksdb` crates cannot leak across backend runs.
 
 This is currently tx-only for real protobuf data: transaction rows are imported, while Decibel fills/orders/positions/builder rows stay empty until event extraction lands.

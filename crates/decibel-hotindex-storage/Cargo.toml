@@ -15,4 +15,3 @@ sha2 = { workspace = true }
 [features]
 default = []
 rocksdb = ["dep:rocksdb"]
-toplingsdb = ["rocksdb"]

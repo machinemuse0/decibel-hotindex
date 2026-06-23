@@ -21,4 +21,3 @@ zstd = { workspace = true }
 [features]
 default = []
 rocksdb = ["decibel-hotindex-storage/rocksdb"]
-toplingsdb = ["rocksdb", "decibel-hotindex-storage/toplingsdb"]

@@ -5,8 +5,6 @@ use decibel_hotindex_core::{
 };
 #[cfg(feature = "rocksdb")]
 use decibel_hotindex_storage::RocksDbEngine;
-#[cfg(feature = "toplingsdb")]
-use decibel_hotindex_storage::ToplingDbEngine;
 use decibel_hotindex_storage::{MemoryEngine, StorageEngine};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -225,21 +223,6 @@ fn run_serving_bench(
             query_corpus,
             corpus,
         ),
-        "toplingdb" => run_toplingdb_serving(
-            dataset,
-            db_path,
-            workload,
-            iterations,
-            warmup,
-            access_pattern,
-            seed,
-            checksum_status,
-            expected_checksum,
-            manifest,
-            started_at,
-            query_corpus,
-            corpus,
-        ),
         other => Err(HotIndexError::Config(format!(
             "unsupported serving backend: {other}"
         ))),
@@ -326,66 +309,6 @@ fn run_rocksdb_serving(
     ))
 }
 
-#[cfg(feature = "toplingsdb")]
-fn run_toplingdb_serving(
-    dataset: &Path,
-    db_path: Option<PathBuf>,
-    workload: &str,
-    iterations: usize,
-    warmup: usize,
-    access_pattern: &str,
-    seed: &str,
-    checksum_status: &str,
-    expected_checksum: Option<&Path>,
-    manifest: &DatasetManifest,
-    started_at: &str,
-    query_corpus: QueryCorpusReport,
-    corpus: Vec<QueryCorpusRecord>,
-) -> Result<BenchmarkReport> {
-    let path = db_path.unwrap_or_else(|| dataset.join("materialized/toplingdb"));
-    let engine = ToplingDbEngine::open(&path)?;
-    let result = measure_queries(&engine, &corpus, iterations, warmup, access_pattern, seed)?;
-    build_report(
-        manifest,
-        dataset,
-        "toplingdb",
-        "serving",
-        workload,
-        iterations,
-        warmup,
-        access_pattern,
-        seed,
-        Some(query_corpus),
-        started_at,
-        result,
-        engine.checksums().ok(),
-        checksum_status,
-        expected_checksum,
-    )
-}
-
-#[cfg(not(feature = "toplingsdb"))]
-#[allow(clippy::too_many_arguments)]
-fn run_toplingdb_serving(
-    _dataset: &Path,
-    _db_path: Option<PathBuf>,
-    _workload: &str,
-    _iterations: usize,
-    _warmup: usize,
-    _access_pattern: &str,
-    _seed: &str,
-    _checksum_status: &str,
-    _expected_checksum: Option<&Path>,
-    _manifest: &DatasetManifest,
-    _started_at: &str,
-    _query_corpus: QueryCorpusReport,
-    _corpus: Vec<QueryCorpusRecord>,
-) -> Result<BenchmarkReport> {
-    Err(HotIndexError::Config(
-        "ToplingDB benchmark requires `--features toplingsdb`".to_string(),
-    ))
-}
-
 fn run_ingest_bench(
     dataset: &Path,
     db_path: Option<PathBuf>,
@@ -423,16 +346,6 @@ fn run_ingest_bench(
             )
         }
         "rocksdb" => run_rocksdb_ingest(
-            dataset,
-            db_path,
-            iterations,
-            warmup,
-            checksum_status,
-            expected_checksum,
-            manifest,
-            started_at,
-        ),
-        "toplingdb" => run_toplingdb_ingest(
             dataset,
             db_path,
             iterations,
@@ -500,58 +413,6 @@ fn run_rocksdb_ingest(
     ))
 }
 
-#[cfg(feature = "toplingsdb")]
-fn run_toplingdb_ingest(
-    dataset: &Path,
-    db_path: Option<PathBuf>,
-    iterations: usize,
-    warmup: usize,
-    checksum_status: &str,
-    expected_checksum: Option<&Path>,
-    manifest: &DatasetManifest,
-    started_at: &str,
-) -> Result<BenchmarkReport> {
-    let rows = IngestRows::load(dataset)?;
-    let path = db_path.unwrap_or_else(|| dataset.join("materialized/toplingdb-bench-ingest"));
-    let engine = ToplingDbEngine::open(path)?;
-    warmup_ingest(&engine, &rows, warmup)?;
-    let result = measure_ingest(&engine, &rows, iterations)?;
-    put_checkpoint_from_manifest(dataset, &engine)?;
-    build_report(
-        manifest,
-        dataset,
-        "toplingdb",
-        "ingest",
-        "normalized_replay",
-        iterations,
-        warmup,
-        "sequential",
-        "normalized-row-order",
-        None,
-        started_at,
-        result,
-        engine.checksums().ok(),
-        checksum_status,
-        expected_checksum,
-    )
-}
-
-#[cfg(not(feature = "toplingsdb"))]
-fn run_toplingdb_ingest(
-    _dataset: &Path,
-    _db_path: Option<PathBuf>,
-    _iterations: usize,
-    _warmup: usize,
-    _checksum_status: &str,
-    _expected_checksum: Option<&Path>,
-    _manifest: &DatasetManifest,
-    _started_at: &str,
-) -> Result<BenchmarkReport> {
-    Err(HotIndexError::Config(
-        "ToplingDB benchmark requires `--features toplingsdb`".to_string(),
-    ))
-}
-
 fn run_read_under_ingest_bench(
     dataset: &Path,
     db_path: Option<PathBuf>,
@@ -616,97 +477,10 @@ fn run_read_under_ingest_bench(
             corpus,
             rows,
         ),
-        "toplingdb" => run_toplingdb_read_under_ingest(
-            dataset,
-            db_path,
-            workload,
-            iterations,
-            warmup,
-            access_pattern,
-            seed,
-            checksum_status,
-            expected_checksum,
-            manifest,
-            started_at,
-            query_corpus,
-            corpus,
-            rows,
-        ),
         other => Err(HotIndexError::Config(format!(
             "unsupported read-under-ingest backend: {other}"
         ))),
     }
-}
-
-#[cfg(feature = "toplingsdb")]
-fn run_toplingdb_read_under_ingest(
-    dataset: &Path,
-    db_path: Option<PathBuf>,
-    workload: &str,
-    iterations: usize,
-    warmup: usize,
-    access_pattern: &str,
-    seed: &str,
-    checksum_status: &str,
-    expected_checksum: Option<&Path>,
-    manifest: &DatasetManifest,
-    started_at: &str,
-    query_corpus: QueryCorpusReport,
-    corpus: Vec<QueryCorpusRecord>,
-    rows: IngestRows,
-) -> Result<BenchmarkReport> {
-    let path = db_path.unwrap_or_else(|| dataset.join("materialized/toplingdb-bench-read-ingest"));
-    let engine = ToplingDbEngine::open(path)?;
-    let result = measure_read_under_ingest(
-        &engine,
-        &rows,
-        &corpus,
-        iterations,
-        warmup,
-        access_pattern,
-        seed,
-    )?;
-    put_checkpoint_from_manifest(dataset, &engine)?;
-    build_report(
-        manifest,
-        dataset,
-        "toplingdb",
-        "read-under-ingest",
-        workload,
-        iterations,
-        warmup,
-        access_pattern,
-        seed,
-        Some(query_corpus),
-        started_at,
-        result,
-        engine.checksums().ok(),
-        checksum_status,
-        expected_checksum,
-    )
-}
-
-#[cfg(not(feature = "toplingsdb"))]
-#[allow(clippy::too_many_arguments)]
-fn run_toplingdb_read_under_ingest(
-    _dataset: &Path,
-    _db_path: Option<PathBuf>,
-    _workload: &str,
-    _iterations: usize,
-    _warmup: usize,
-    _access_pattern: &str,
-    _seed: &str,
-    _checksum_status: &str,
-    _expected_checksum: Option<&Path>,
-    _manifest: &DatasetManifest,
-    _started_at: &str,
-    _query_corpus: QueryCorpusReport,
-    _corpus: Vec<QueryCorpusRecord>,
-    _rows: IngestRows,
-) -> Result<BenchmarkReport> {
-    Err(HotIndexError::Config(
-        "ToplingDB benchmark requires `--features toplingsdb`".to_string(),
-    ))
 }
 
 #[cfg(feature = "rocksdb")]

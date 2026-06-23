@@ -5,7 +5,7 @@ usage() {
   cat <<'USAGE'
 Usage:
   scripts/run-benchmark-suite.sh \
-    --backend <memory|rocksdb|toplingdb|both> \
+    --backend <memory|rocksdb> \
     --dataset <dataset-root> \
     [--bin-dir <path>] \
     [--bench-bin <path>] \
@@ -18,13 +18,11 @@ Usage:
     [--seed <value>] \
     [--db-path <path>] \
     [--rocksdb-path <path>] \
-    [--toplingdb-path <path>] \
     [--report-dir <path>] \
     [--out <path>] \
     [--summary-out <path>] \
     [--expected-checksum <auto|none|path>] \
     [--checksum-status <status>] \
-    [--toplingdb-conf <path>] \
     [--no-summary] \
     [--dry-run]
 
@@ -45,26 +43,29 @@ Defaults:
   - expected checksum: auto
 
 Examples:
-  scripts/run-benchmark-suite.sh \
+  rtk ./scripts/run-benchmark-suite.sh \
     --backend rocksdb \
     --dataset "$DATASET_ROOT" \
-    --bin-dir target/release
+    --bin-dir target/rocksdb/release
 
-  scripts/run-benchmark-suite.sh \
-    --backend both \
+  rtk ./scripts/run-benchmark-suite.sh \
+    --backend rocksdb \
     --dataset "$DATASET_ROOT" \
     --workloads get_tx_by_version,multi_get_tx_versions_100 \
-    --bin-dir target/release
+    --bin-dir target/rocksdb/release
 
-  scripts/run-benchmark-suite.sh \
+  rtk ./scripts/run-benchmark-suite.sh \
     --backend rocksdb \
     --dataset "$DATASET_ROOT" \
     --class ingest \
-    --bin-dir target/release
+    --bin-dir target/rocksdb/release
 
-Build hints:
-  rtk cargo build -p decibel-hotindex-bench --features rocksdb --release
-  rtk cargo build -p decibel-hotindex-bench --features toplingsdb --release
+Build hint:
+  rtk cargo build -p decibel-hotindex-bench --features rocksdb --release --target-dir target/rocksdb
+
+Note:
+  ToplingDB benchmark runs must be launched from the dedicated topingdb
+  worktree. This main worktree intentionally accepts only memory and RocksDB.
 USAGE
 }
 
@@ -101,13 +102,11 @@ ACCESS_PATTERN="zipfian"
 SEED="6840346605343600653"
 DB_PATH=""
 ROCKSDB_PATH=""
-TOPLINGDB_PATH=""
 REPORT_DIR=""
 OUT_PATH=""
 SUMMARY_OUT=""
 EXPECTED_CHECKSUM="auto"
 CHECKSUM_STATUS="not_run"
-TOPLINGDB_CONF="${TOPLINGDB_EASY_MIGRATE_CONF:-}"
 NO_SUMMARY=0
 DRY_RUN=0
 
@@ -170,10 +169,6 @@ while [[ $# -gt 0 ]]; do
       ROCKSDB_PATH="${2:-}"
       shift 2
       ;;
-    --toplingdb-path)
-      TOPLINGDB_PATH="${2:-}"
-      shift 2
-      ;;
     --report-dir)
       REPORT_DIR="${2:-}"
       shift 2
@@ -192,10 +187,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --checksum-status)
       CHECKSUM_STATUS="${2:-}"
-      shift 2
-      ;;
-    --toplingdb-conf)
-      TOPLINGDB_CONF="${2:-}"
       shift 2
       ;;
     --no-summary)
@@ -225,8 +216,14 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
 fi
 
 case "$BACKEND" in
-  memory | rocksdb | toplingdb | both | all) ;;
-  *) die "--backend must be memory, rocksdb, toplingdb, both, or all" ;;
+  memory | rocksdb) ;;
+  toplingdb)
+    die "ToplingDB benchmarks must be run from the dedicated topingdb worktree"
+    ;;
+  both | all)
+    die "combined backend benchmarks are forbidden; run isolated worktrees separately"
+    ;;
+  *) die "--backend must be memory or rocksdb" ;;
 esac
 
 case "$BENCH_CLASS" in
@@ -239,12 +236,8 @@ case "$ACCESS_PATTERN" in
   *) die "--access-pattern must be sequential, uniform, or zipfian" ;;
 esac
 
-if [[ -n "$DB_PATH" && ( "$BACKEND" == "both" || "$BACKEND" == "all" ) ]]; then
-  die "--db-path is only valid for a single backend; use --rocksdb-path and --toplingdb-path for both"
-fi
-
-if [[ -n "$OUT_PATH" && ( "$BACKEND" == "both" || "$BACKEND" == "all" || "$WORKLOADS" == *","* ) ]]; then
-  die "--out is only valid for one backend and one workload"
+if [[ -n "$OUT_PATH" && "$WORKLOADS" == *","* ]]; then
+  die "--out is only valid for one workload"
 fi
 
 resolve_bench_bin() {
@@ -289,9 +282,7 @@ sanitize_name() {
 }
 
 backend_db_path() {
-  local target_backend="$1"
-
-  if [[ "$target_backend" == "memory" ]]; then
+  if [[ "$BACKEND" == "memory" ]]; then
     return
   fi
 
@@ -304,26 +295,14 @@ backend_db_path() {
     return
   fi
 
-  case "$target_backend" in
-    rocksdb)
-      if [[ -n "$ROCKSDB_PATH" ]]; then
-        echo "$ROCKSDB_PATH"
-      else
-        echo "$DATASET_ROOT/materialized/rocksdb"
-      fi
-      ;;
-    toplingdb)
-      if [[ -n "$TOPLINGDB_PATH" ]]; then
-        echo "$TOPLINGDB_PATH"
-      else
-        echo "$DATASET_ROOT/materialized/toplingdb"
-      fi
-      ;;
-  esac
+  if [[ -n "$ROCKSDB_PATH" ]]; then
+    echo "$ROCKSDB_PATH"
+  else
+    echo "$DATASET_ROOT/materialized/rocksdb"
+  fi
 }
 
 resolve_expected_checksum() {
-  local target_backend="$1"
   local path=""
 
   case "$EXPECTED_CHECKSUM" in
@@ -333,8 +312,6 @@ resolve_expected_checksum() {
     auto)
       if [[ -f "$DATASET_ROOT/reports/rocksdb-checksums.json" ]]; then
         path="$DATASET_ROOT/reports/rocksdb-checksums.json"
-      elif [[ -f "$DATASET_ROOT/reports/${target_backend}-checksums.json" ]]; then
-        path="$DATASET_ROOT/reports/${target_backend}-checksums.json"
       fi
       ;;
     *)
@@ -364,13 +341,12 @@ join_reports() {
 }
 
 run_one_benchmark() {
-  local target_backend="$1"
-  local workload="$2"
-  local report_path="$3"
+  local workload="$1"
+  local report_path="$2"
   local args=(
     run
     --dataset "$DATASET_ROOT"
-    --engine "$target_backend"
+    --engine "$BACKEND"
     --class "$BENCH_CLASS"
     --iterations "$ITERATIONS"
     --warmup "$WARMUP"
@@ -383,23 +359,23 @@ run_one_benchmark() {
   fi
 
   local db_path
-  db_path="$(backend_db_path "$target_backend")"
+  db_path="$(backend_db_path)"
   if [[ -n "$db_path" ]]; then
     if [[ "$DRY_RUN" -eq 0 && "$BENCH_CLASS" == "serving" && ! -d "$db_path" ]]; then
-      die "serving DB path does not exist for $target_backend: $db_path"
+      die "serving DB path does not exist for $BACKEND: $db_path"
     fi
     args+=(--db-path "$db_path")
   fi
 
   local expected_checksum_path
-  expected_checksum_path="$(resolve_expected_checksum "$target_backend")"
+  expected_checksum_path="$(resolve_expected_checksum)"
   if [[ -n "$expected_checksum_path" ]]; then
     args+=(--expected-checksum "$expected_checksum_path")
   else
     args+=(--checksum-status "$CHECKSUM_STATUS")
   fi
 
-  echo "benchmark: backend=$target_backend class=$BENCH_CLASS workload=$workload report=$report_path"
+  echo "benchmark: backend=$BACKEND class=$BENCH_CLASS workload=$workload report=$report_path"
   run_cmd "$BENCH_BIN" "${args[@]}"
 }
 
@@ -416,25 +392,6 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
   mkdir -p "$REPORT_DIR"
 fi
 
-backends=()
-case "$BACKEND" in
-  both | all)
-    backends=(rocksdb toplingdb)
-    ;;
-  *)
-    backends=("$BACKEND")
-    ;;
-esac
-
-if [[ " ${backends[*]} " == *" toplingdb "* ]]; then
-  if [[ -n "$TOPLINGDB_CONF" ]]; then
-    export TOPLINGDB_EASY_MIGRATE_CONF="$TOPLINGDB_CONF"
-  fi
-  if [[ "$DRY_RUN" -eq 0 ]]; then
-    [[ -f "${TOPLINGDB_EASY_MIGRATE_CONF:-}" ]] || die "ToplingDB requires TOPLINGDB_EASY_MIGRATE_CONF or --toplingdb-conf"
-  fi
-fi
-
 workloads=()
 if [[ "$BENCH_CLASS" == "ingest" ]]; then
   workloads=(normalized_replay)
@@ -443,22 +400,20 @@ else
 fi
 
 reports=()
-for target_backend in "${backends[@]}"; do
-  for workload in "${workloads[@]}"; do
-    workload="${workload//[[:space:]]/}"
-    [[ -n "$workload" ]] || continue
+for workload in "${workloads[@]}"; do
+  workload="${workload//[[:space:]]/}"
+  [[ -n "$workload" ]] || continue
 
-    if [[ -n "$OUT_PATH" ]]; then
-      report_path="$OUT_PATH"
-    else
-      report_workload="$(sanitize_name "$workload")"
-      report_class="$(sanitize_name "$BENCH_CLASS")"
-      report_path="$REPORT_DIR/bench-${target_backend}-${report_class}-${report_workload}.json"
-    fi
+  if [[ -n "$OUT_PATH" ]]; then
+    report_path="$OUT_PATH"
+  else
+    report_workload="$(sanitize_name "$workload")"
+    report_class="$(sanitize_name "$BENCH_CLASS")"
+    report_path="$REPORT_DIR/bench-${BACKEND}-${report_class}-${report_workload}.json"
+  fi
 
-    run_one_benchmark "$target_backend" "$workload" "$report_path"
-    reports+=("$report_path")
-  done
+  run_one_benchmark "$workload" "$report_path"
+  reports+=("$report_path")
 done
 
 if [[ "${#reports[@]}" -eq 0 ]]; then

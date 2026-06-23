@@ -1,6 +1,6 @@
 # Decibel HotIndex
 
-Decibel HotIndex is a ToplingDB/RocksDB-backed local serving layer and builder analytics gateway for Decibel trading events on Aptos.
+Decibel HotIndex is a RocksDB-baseline local serving layer and builder analytics gateway for Decibel trading events on Aptos, with ToplingDB isolated in a dedicated `topingdb` worktree.
 
 The project is Decibel-specific infrastructure, not a generic Aptos explorer and not a trading strategy. It records bounded mainnet transaction-stream data once into an immutable local raw archive, normalizes Decibel events, replays the same dataset into multiple storage backends, and benchmarks the same schema, dataset, keyset, and workload.
 
@@ -19,13 +19,13 @@ Milestone 4 is in progress:
 - fixture JSONL raw dataset generation
 - Decibel parser adapter for fixture normalization
 - unknown Decibel event payload preservation
-- feature-gated RocksDB backend implementation
-- feature-gated ToplingDB stub
+- RocksDB backend implementation on `main`
+- ToplingDB integration isolated on the `topingdb` branch/worktree
 - admin checksum / compare-checksum commands
 - mainnet raw archive recording: length-delimited Aptos Transaction protobuf + zstd
 - mainnet protobuf normalization: tx rows only; Decibel event extraction is pending
 - RocksDB replay from the same saved dataset
-- ToplingDB native binding: pending; do not publish RocksDB vs ToplingDB numbers yet
+- ToplingDB native binding is patched only in the `topingdb` worktree; do not publish RocksDB vs ToplingDB numbers without checksum equivalence
 - REST API: not started (M6)
 - benchmark runner: offline smoke/CI only until methodology hardening lands
 
@@ -69,7 +69,7 @@ rtk cargo run -p decibel-dataset -- replay --dataset /private/tmp/decibel-hotind
 
 ## Data Rule
 
-Mainnet raw data should be pulled as few times as possible, ideally once per bounded dataset. RocksDB and ToplingDB benchmarks must replay from the same saved raw/normalized dataset. Benchmark code must not call Aptos gRPC.
+Mainnet raw data should be pulled as few times as possible, ideally once per bounded dataset. RocksDB and ToplingDB benchmarks must replay from the same saved raw/normalized dataset, but from separate backend worktrees. Benchmark code must not call Aptos gRPC.
 
 ## Non-Goals
 
@@ -90,4 +90,6 @@ Builder-code metrics are analytics estimates from parsed Decibel events, not off
 - [Milestone 4 Plan](docs/MILESTONE_4_PLAN.md)
 - [Dataset Layout](docs/DATASET_LAYOUT.md)
 - [Benchmark Methodology](docs/BENCHMARK_METHODOLOGY.md)
+- [Backend Worktrees](docs/BACKEND_WORKTREES.md)
+- [Local RocksDB End-to-End Flow](docs/LOCAL_ROCKSDB_FLOW.md)
 - [Spikes](docs/SPIKES.md)

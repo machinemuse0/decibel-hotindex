@@ -4,25 +4,28 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/import-real-data.sh <rocksdb|toplingdb|both> <dataset-root> [options]
+  scripts/import-real-data.sh rocksdb <dataset-root> [options]
 
 Options:
-  --bin-dir <path>         Directory containing decibel-dataset and decibel-admin binaries.
-                           Default: DECIBEL_BIN_DIR, then target/release, then target/debug.
-  --raw-input <path>       Raw .pb.zst chunk or raw directory. Default: <dataset-root>/raw
-  --skip-normalize         Reuse existing <dataset-root>/normalized and manifest.json
-  --force-normalize        Rebuild normalized tx-only artifacts even if they already exist
-  --force                  Remove existing materialized backend DB path before replay
-  --network <name>         Dataset network metadata. Default: mainnet
-  --dataset-id <id>        Dataset id metadata. Default: dataset root basename
-  --parser-commit <sha>    Parser commit metadata
-  --config <path>          Decibel config for addresses/network defaults
-  --toplingdb-conf <path>  Sets TOPLINGDB_EASY_MIGRATE_CONF for ToplingDB
+  --bin-dir <path>       Directory containing decibel-dataset and decibel-admin binaries.
+                         Default: DECIBEL_BIN_DIR, then target/release, then target/debug.
+  --raw-input <path>     Raw .pb.zst chunk or raw directory. Default: <dataset-root>/raw
+  --skip-normalize       Reuse existing <dataset-root>/normalized and manifest.json
+  --force-normalize      Rebuild normalized tx-only artifacts even if they already exist
+  --force                Remove existing materialized RocksDB path before replay
+  --network <name>       Dataset network metadata. Default: mainnet
+  --dataset-id <id>      Dataset id metadata. Default: dataset root basename
+  --parser-commit <sha>  Parser commit metadata
+  --config <path>        Decibel config for addresses/network defaults
 
 Examples:
-  cargo build -p decibel-dataset -p decibel-admin --features rocksdb --release
-  scripts/import-real-data.sh rocksdb /data/decibel-hotindex/datasets/mainnet-4365621793-4381375638
-  scripts/import-real-data.sh both /data/decibel-hotindex/datasets/mainnet-4365621793-4381375638 --force
+  rtk cargo build -p decibel-dataset -p decibel-admin --features rocksdb --release --target-dir target/rocksdb
+  rtk ./scripts/import-real-data.sh rocksdb /data/decibel-hotindex/datasets/mainnet-4365621793-4381375638 --bin-dir target/rocksdb/release
+
+Note:
+  ToplingDB imports must be run from the dedicated topingdb worktree. This
+  main worktree intentionally accepts only RocksDB so patched rocksdb crates
+  and TOPLINGDB_EASY_MIGRATE_CONF cannot leak into the baseline.
 USAGE
 }
 
@@ -42,6 +45,8 @@ run_cmd() {
   fi
 }
 
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 default_bin_dir() {
   if [[ -x "$repo_root/target/release/decibel-dataset" && -x "$repo_root/target/release/decibel-admin" ]]; then
     echo "$repo_root/target/release"
@@ -55,20 +60,24 @@ default_bin_dir() {
 }
 
 build_hint() {
-  if [[ "$backend" == "toplingdb" || "$backend" == "both" ]]; then
-    echo "rtk cargo build -p decibel-dataset -p decibel-admin --features toplingsdb --release"
-  else
-    echo "rtk cargo build -p decibel-dataset -p decibel-admin --features rocksdb --release"
+  echo "rtk cargo build -p decibel-dataset -p decibel-admin --features rocksdb --release --target-dir target/rocksdb"
+}
+
+resolve_bin_dir() {
+  local selected="$1"
+  if [[ -z "$selected" ]]; then
+    selected="$bin_dir"
   fi
+  if [[ -z "$selected" ]]; then
+    selected="$(default_bin_dir)" || die "could not find compiled decibel binaries; build first with: $(build_hint)"
+  fi
+  echo "$selected"
 }
 
 resolve_binaries() {
-  if [[ -z "$bin_dir" ]]; then
-    bin_dir="$(default_bin_dir)" || die "could not find compiled decibel binaries; build first with: $(build_hint)"
-  fi
-
-  dataset_bin="$bin_dir/decibel-dataset"
-  admin_bin="$bin_dir/decibel-admin"
+  local selected_bin_dir="$1"
+  dataset_bin="$selected_bin_dir/decibel-dataset"
+  admin_bin="$selected_bin_dir/decibel-admin"
   [[ -x "$dataset_bin" ]] || die "missing executable: $dataset_bin; build first with: $(build_hint)"
   [[ -x "$admin_bin" ]] || die "missing executable: $admin_bin; build first with: $(build_hint)"
 }
@@ -78,13 +87,18 @@ if [[ $# -lt 2 ]]; then
   exit 2
 fi
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 backend="$1"
 dataset_root="$2"
 shift 2
 
 case "$backend" in
-  rocksdb | toplingdb | both) ;;
+  rocksdb) ;;
+  toplingdb)
+    die "ToplingDB imports must be run from the dedicated topingdb worktree"
+    ;;
+  both | all)
+    die "combined backend imports are forbidden; run isolated worktrees separately"
+    ;;
   *)
     usage
     die "unsupported backend: $backend"
@@ -102,7 +116,6 @@ network="mainnet"
 dataset_id=""
 parser_commit=""
 config_path=""
-toplingdb_conf="${TOPLINGDB_EASY_MIGRATE_CONF:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -142,10 +155,6 @@ while [[ $# -gt 0 ]]; do
       config_path="${2:-}"
       shift 2
       ;;
-    --toplingdb-conf)
-      toplingdb_conf="${2:-}"
-      shift 2
-      ;;
     -h | --help)
       usage
       exit 0
@@ -163,7 +172,8 @@ if [[ -z "$raw_input" ]]; then
   raw_input="$dataset_root/raw"
 fi
 
-resolve_binaries
+selected_bin_dir="$(resolve_bin_dir "$bin_dir")"
+resolve_binaries "$selected_bin_dir"
 
 normalize_dataset() {
   if [[ "$skip_normalize" -eq 1 ]]; then
@@ -199,17 +209,9 @@ normalize_dataset() {
   run_cmd "${args[@]}"
 }
 
-import_backend() {
-  local target_backend="$1"
-  local db_path="$dataset_root/materialized/$target_backend"
-  local checksum_path="$dataset_root/reports/${target_backend}-checksums.json"
-
-  if [[ "$target_backend" == "toplingdb" ]]; then
-    if [[ -n "$toplingdb_conf" ]]; then
-      export TOPLINGDB_EASY_MIGRATE_CONF="$toplingdb_conf"
-    fi
-    [[ -f "${TOPLINGDB_EASY_MIGRATE_CONF:-}" ]] || die "ToplingDB requires TOPLINGDB_EASY_MIGRATE_CONF or --toplingdb-conf"
-  fi
+import_rocksdb() {
+  local db_path="$dataset_root/materialized/rocksdb"
+  local checksum_path="$dataset_root/reports/rocksdb-checksums.json"
 
   if [[ -e "$db_path" ]]; then
     if [[ "$force" -eq 1 ]]; then
@@ -223,31 +225,16 @@ import_backend() {
 
   run_cmd "$dataset_bin" replay \
     --dataset "$dataset_root" \
-    --engine "$target_backend" \
+    --engine rocksdb \
     --db-path "$db_path"
 
   run_cmd "$admin_bin" checksum \
-    --engine "$target_backend" \
+    --engine rocksdb \
     --db-path "$db_path" \
     --out "$checksum_path"
 }
 
 normalize_dataset
+import_rocksdb
 
-case "$backend" in
-  rocksdb)
-    import_backend rocksdb
-    ;;
-  toplingdb)
-    import_backend toplingdb
-    ;;
-  both)
-    import_backend rocksdb
-    import_backend toplingdb
-    run_cmd "$admin_bin" compare-checksum \
-      --left "$dataset_root/reports/rocksdb-checksums.json" \
-      --right "$dataset_root/reports/toplingdb-checksums.json"
-    ;;
-esac
-
-echo "import complete: backend=$backend dataset=$dataset_root"
+echo "import complete: backend=rocksdb dataset=$dataset_root"

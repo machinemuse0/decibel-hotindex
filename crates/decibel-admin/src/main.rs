@@ -3,8 +3,6 @@ use decibel_hotindex_core::{CfChecksum, HotIndexError, Result};
 use decibel_hotindex_storage::RocksDbEngine;
 #[cfg(feature = "rocksdb")]
 use decibel_hotindex_storage::StorageEngine;
-#[cfg(feature = "toplingsdb")]
-use decibel_hotindex_storage::ToplingDbEngine;
 use std::env;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
@@ -39,7 +37,6 @@ fn checksum_command(args: &[String]) -> Result<()> {
     let engine = opts.optional_value("--engine").unwrap_or("rocksdb");
     let checksums = match engine {
         "rocksdb" => rocksdb_checksums(&opts)?,
-        "toplingdb" => toplingdb_checksums(&opts)?,
         other => {
             return Err(HotIndexError::Config(format!(
                 "unsupported checksum engine: {other}"
@@ -66,19 +63,6 @@ fn rocksdb_checksums(opts: &Args<'_>) -> Result<Vec<CfChecksum>> {
 fn rocksdb_checksums(_opts: &Args<'_>) -> Result<Vec<CfChecksum>> {
     Err(HotIndexError::Config(
         "RocksDB checksum requires `--features rocksdb`".to_string(),
-    ))
-}
-
-#[cfg(feature = "toplingsdb")]
-fn toplingdb_checksums(opts: &Args<'_>) -> Result<Vec<CfChecksum>> {
-    let db_path = opts.required_path("--db-path")?;
-    ToplingDbEngine::open(db_path)?.checksums()
-}
-
-#[cfg(not(feature = "toplingsdb"))]
-fn toplingdb_checksums(_opts: &Args<'_>) -> Result<Vec<CfChecksum>> {
-    Err(HotIndexError::Config(
-        "ToplingDB checksum requires `--features toplingsdb`".to_string(),
     ))
 }
 
@@ -143,7 +127,6 @@ fn print_usage() {
     eprintln!(
         "usage:
   decibel-admin checksum --engine rocksdb --db-path <path> [--out <checksums.json>]
-  decibel-admin checksum --engine toplingdb --db-path <path> [--out <checksums.json>]
   decibel-admin compare-checksum --left <checksums.json> --right <checksums.json>"
     );
 }

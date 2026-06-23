@@ -11,8 +11,6 @@ use decibel_hotindex_core::{
 use decibel_hotindex_ingest::{parse_fixture_jsonl_file, ParserOptions, ParserOutput};
 #[cfg(feature = "rocksdb")]
 use decibel_hotindex_storage::RocksDbEngine;
-#[cfg(feature = "toplingsdb")]
-use decibel_hotindex_storage::ToplingDbEngine;
 use decibel_hotindex_storage::{MemoryEngine, StorageEngine};
 use prost::Message;
 use serde::de::DeserializeOwned;
@@ -23,7 +21,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tonic::transport::{Channel, ClientTlsConfig};
 
 const NORMALIZED_ARTIFACTS: &[&str] = &[
@@ -53,6 +51,7 @@ const MAINNET_DECIBEL_ADDRESS: &str =
 const TESTNET_DECIBEL_ADDRESS: &str =
     "0xe7da2794b1d8af76532ed95f38bfdf1136abfd8ea3a240189971988a83101b7f";
 const DEFAULT_RECORD_CHUNK_TRANSACTION_COUNT: u64 = 100_000;
+const DEFAULT_RECORD_PROGRESS_INTERVAL_SECS: u64 = 30;
 
 fn main() {
     if let Err(error) = run(env::args().skip(1).collect()) {
@@ -233,21 +232,9 @@ fn replay_command(args: &[String]) -> Result<()> {
                 "RocksDB replay requires `--features rocksdb`".to_string(),
             ));
         }
-        #[cfg(feature = "toplingsdb")]
-        "toplingdb" => {
-            let db_path = opts
-                .optional_value("--db-path")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| dataset.join("materialized/toplingdb"));
-            let engine = ToplingDbEngine::open(&db_path)?;
-            replay_into_engine(&dataset, &engine)?;
-            print_replay_result(&engine)?;
-            println!("toplingdb path={}", db_path.display());
-        }
-        #[cfg(not(feature = "toplingsdb"))]
         "toplingdb" => {
             return Err(HotIndexError::Config(
-                "ToplingDB replay requires `--features toplingsdb`".to_string(),
+                "ToplingDB replay is only available in the topingdb worktree".to_string(),
             ));
         }
         other => {
@@ -330,6 +317,9 @@ fn record_command(args: &[String]) -> Result<()> {
     let max_raw_bytes = opts.optional_bytes("--max-raw-bytes")?;
     let max_stream_retries = opts.optional_u64("--max-stream-retries")?.unwrap_or(10);
     let retry_backoff_ms = opts.optional_u64("--retry-backoff-ms")?.unwrap_or(2_000);
+    let progress_interval_secs = opts
+        .optional_u64("--progress-interval-secs")?
+        .unwrap_or(DEFAULT_RECORD_PROGRESS_INTERVAL_SECS);
     let record_chunk_transaction_count = opts
         .optional_u64("--chunk-transaction-count")?
         .unwrap_or(DEFAULT_RECORD_CHUNK_TRANSACTION_COUNT);
@@ -381,6 +371,7 @@ fn record_command(args: &[String]) -> Result<()> {
             key_sample_limit: opts
                 .optional_u64("--key-sample-limit")?
                 .unwrap_or(1_000_000),
+            progress_interval: Duration::from_secs(progress_interval_secs),
             out_dir: out_dir.clone(),
             raw_format: raw_format.to_string(),
             package_address,
@@ -427,6 +418,7 @@ fn record_command(args: &[String]) -> Result<()> {
         "max_raw_bytes": max_raw_bytes,
         "max_stream_retries": max_stream_retries,
         "retry_backoff_ms": retry_backoff_ms,
+        "progress_interval_secs": progress_interval_secs,
         "chunk_transaction_count": record_chunk_transaction_count,
         "transaction_count": resume_transaction_count,
         "chunks": resume_state.chunks
@@ -451,6 +443,7 @@ struct LiveRecordRequest {
     max_raw_bytes: Option<u64>,
     chunk_transaction_count: u64,
     key_sample_limit: u64,
+    progress_interval: Duration,
     out_dir: PathBuf,
     raw_format: String,
     package_address: String,
@@ -782,6 +775,8 @@ async fn record_live_transaction_stream(request: LiveRecordRequest) -> Result<Re
     let mut stopped_at_byte_limit = false;
     let mut chunks = request.previous_chunks.clone();
     let mut active_chunk = None;
+    let mut progress = RecordProgressReporter::new(&request, expected_count)?;
+    progress.print_start(&request, expected_count);
 
     'stream: loop {
         let response = match stream.message().await {
@@ -792,6 +787,14 @@ async fn record_live_transaction_stream(request: LiveRecordRequest) -> Result<Re
                 if count > 0 {
                     finish_active_chunk(&request, &mut active_chunk, &mut chunks)?;
                     let last_success_version = last_version.unwrap_or(request.start_version);
+                    progress.report(
+                        "interrupted",
+                        count,
+                        last_version,
+                        uncompressed_raw_bytes,
+                        chunks.len(),
+                        true,
+                    );
                     let key_report = key_writer.finish(&request, last_success_version)?;
                     write_record_checkpoint(
                         &request,
@@ -849,6 +852,14 @@ async fn record_live_transaction_stream(request: LiveRecordRequest) -> Result<Re
             if writer.transaction_count() >= request.chunk_transaction_count {
                 finish_active_chunk(&request, &mut active_chunk, &mut chunks)?;
                 let last_success_version = last_version.unwrap_or(request.start_version);
+                progress.report(
+                    "chunk-flushed",
+                    count,
+                    last_version,
+                    uncompressed_raw_bytes,
+                    chunks.len(),
+                    true,
+                );
                 write_record_checkpoint(
                     &request,
                     "recording",
@@ -873,6 +884,14 @@ async fn record_live_transaction_stream(request: LiveRecordRequest) -> Result<Re
                 break 'stream;
             }
         }
+        progress.report(
+            "recording",
+            count,
+            last_version,
+            uncompressed_raw_bytes,
+            chunks.len(),
+            false,
+        );
     }
     finish_active_chunk(&request, &mut active_chunk, &mut chunks)?;
 
@@ -882,6 +901,14 @@ async fn record_live_transaction_stream(request: LiveRecordRequest) -> Result<Re
         ));
     }
     let last_success_version = last_version.unwrap_or(request.start_version);
+    progress.report(
+        "complete",
+        count,
+        last_version,
+        uncompressed_raw_bytes,
+        chunks.len(),
+        true,
+    );
     let key_report = key_writer.finish(&request, last_success_version)?;
     let message = if stopped_at_byte_limit {
         "recorded Aptos Transaction Stream raw protobuf chunks; stopped at max raw byte limit"
@@ -914,6 +941,179 @@ async fn record_live_transaction_stream(request: LiveRecordRequest) -> Result<Re
         raw_bytes: uncompressed_raw_bytes,
         stopped_at_byte_limit,
     })
+}
+
+struct RecordProgressReporter {
+    started_at: Instant,
+    last_report_at: Instant,
+    interval: Duration,
+    expected_count: u64,
+    prior_transaction_count: u64,
+    max_raw_bytes: Option<u64>,
+}
+
+impl RecordProgressReporter {
+    fn new(request: &LiveRecordRequest, expected_count: u64) -> Result<Self> {
+        let now = Instant::now();
+        let prior_transaction_count =
+            request
+                .previous_chunks
+                .iter()
+                .try_fold(0_u64, |acc, chunk| {
+                    acc.checked_add(chunk_transaction_count(chunk))
+                        .ok_or_else(|| {
+                            HotIndexError::Config(
+                                "checkpoint transaction count overflow".to_string(),
+                            )
+                        })
+                })?;
+        Ok(Self {
+            started_at: now,
+            last_report_at: now,
+            interval: request.progress_interval,
+            expected_count,
+            prior_transaction_count,
+            max_raw_bytes: request.max_raw_bytes,
+        })
+    }
+
+    fn print_start(&self, request: &LiveRecordRequest, expected_count: u64) {
+        eprintln!(
+            "record started: range={}..{} expected_tx={} batch_size={} chunk_tx={} max_raw_bytes={} out_dir={} progress_interval_secs={}",
+            request.start_version,
+            request.end_version,
+            expected_count,
+            request.batch_size,
+            request.chunk_transaction_count,
+            request
+                .max_raw_bytes
+                .map(format_bytes)
+                .unwrap_or_else(|| "none".to_string()),
+            request.out_dir.display(),
+            self.interval.as_secs()
+        );
+    }
+
+    fn report(
+        &mut self,
+        status: &str,
+        run_transaction_count: u64,
+        last_version: Option<u64>,
+        uncompressed_raw_bytes: u64,
+        completed_chunks: usize,
+        force: bool,
+    ) {
+        let now = Instant::now();
+        if !force
+            && (self.interval.is_zero() || now.duration_since(self.last_report_at) < self.interval)
+        {
+            return;
+        }
+        self.last_report_at = now;
+        let elapsed = now.duration_since(self.started_at);
+        let tx_pct = percent(run_transaction_count, self.expected_count);
+        let tx_rate = rate_per_sec(run_transaction_count, elapsed);
+        let byte_rate_mib = bytes_per_sec_mib(uncompressed_raw_bytes, elapsed);
+        let dataset_transaction_count = self
+            .prior_transaction_count
+            .saturating_add(run_transaction_count);
+        let eta = estimate_eta(elapsed, run_transaction_count, self.expected_count);
+        let raw_limit = self
+            .max_raw_bytes
+            .map(|limit| {
+                format!(
+                    " / {} ({:.2}%)",
+                    format_bytes(limit),
+                    percent(uncompressed_raw_bytes, limit)
+                )
+            })
+            .unwrap_or_default();
+        let last_version_display = last_version
+            .map(|version| version.to_string())
+            .unwrap_or_else(|| "n/a".to_string());
+        let next_start_version = last_version
+            .and_then(|version| version.checked_add(1))
+            .map(|version| version.to_string())
+            .unwrap_or_else(|| "n/a".to_string());
+
+        eprintln!(
+            "record progress: status={} run_tx={}/{} ({:.2}%) dataset_tx={} last_version={} next_start_version={} chunks={} raw={}{} elapsed={} rate={:.1} tx/s {:.2} MiB/s eta={}",
+            status,
+            run_transaction_count,
+            self.expected_count,
+            tx_pct,
+            dataset_transaction_count,
+            last_version_display,
+            next_start_version,
+            completed_chunks,
+            format_bytes(uncompressed_raw_bytes),
+            raw_limit,
+            format_duration(elapsed),
+            tx_rate,
+            byte_rate_mib,
+            eta
+        );
+    }
+}
+
+fn percent(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        0.0
+    } else {
+        (numerator as f64 / denominator as f64) * 100.0
+    }
+}
+
+fn rate_per_sec(count: u64, elapsed: Duration) -> f64 {
+    let seconds = elapsed.as_secs_f64();
+    if seconds > 0.0 {
+        count as f64 / seconds
+    } else {
+        0.0
+    }
+}
+
+fn bytes_per_sec_mib(bytes: u64, elapsed: Duration) -> f64 {
+    rate_per_sec(bytes, elapsed) / (1024.0 * 1024.0)
+}
+
+fn estimate_eta(elapsed: Duration, completed: u64, expected: u64) -> String {
+    if completed == 0 || completed >= expected {
+        return "n/a".to_string();
+    }
+    let elapsed_seconds = elapsed.as_secs_f64();
+    let remaining_seconds = elapsed_seconds * ((expected - completed) as f64 / completed as f64);
+    format_duration(Duration::from_secs_f64(remaining_seconds.max(0.0)))
+}
+
+fn format_duration(duration: Duration) -> String {
+    let total_seconds = duration.as_secs();
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+    if hours > 0 {
+        format!("{hours}h{minutes:02}m{seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes_f = bytes as f64;
+    if bytes_f >= GIB {
+        format!("{:.2}GiB", bytes_f / GIB)
+    } else if bytes_f >= MIB {
+        format!("{:.2}MiB", bytes_f / MIB)
+    } else if bytes_f >= KIB {
+        format!("{:.2}KiB", bytes_f / KIB)
+    } else {
+        format!("{bytes}B")
+    }
 }
 
 fn finish_active_chunk(
@@ -2567,7 +2767,7 @@ fn print_usage() {
   decibel-dataset replay --dataset <dataset-dir> [--engine memory]
   decibel-dataset normalize --input <raw.pb.zst|raw-dir|fixture.jsonl> --out-dir <normalized-dir> [--format fixture-jsonl|protobuf-zstd] [--config <config.yaml>]
   decibel-dataset inspect-raw --input <transactions.pb.zst> [--limit <n>] [--allow-truncated]
-  decibel-dataset record --live --network mainnet --endpoint <url> [--auth-token <token>|--auth-token-env <env>] [--resume] [--allow-low-mainnet-start] [--batch-size <n>] [--chunk-transaction-count <n>] [--max-raw-bytes <10GiB>] [--max-stream-retries <n>] [--retry-backoff-ms <n>] [--key-sample-limit <n>] [--package-address <addr>] [--orderbook-address <addr>] (--start-version <n> (--end-version <n>|--transactions-count <n>)|--resume --end-version <n>) --out-dir <raw-dir> --raw-format protobuf-zstd"
+  decibel-dataset record --live --network mainnet --endpoint <url> [--auth-token <token>|--auth-token-env <env>] [--resume] [--allow-low-mainnet-start] [--batch-size <n>] [--chunk-transaction-count <n>] [--max-raw-bytes <10GiB>] [--max-stream-retries <n>] [--retry-backoff-ms <n>] [--progress-interval-secs <n>] [--key-sample-limit <n>] [--package-address <addr>] [--orderbook-address <addr>] (--start-version <n> (--end-version <n>|--transactions-count <n>)|--resume --end-version <n>) --out-dir <raw-dir> --raw-format protobuf-zstd"
     );
 }
 
