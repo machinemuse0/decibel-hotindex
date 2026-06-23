@@ -253,8 +253,8 @@ rtk cargo test -p decibel-hotindex-storage --features rocksdb
 Import downloaded raw chunks into RocksDB:
 
 ```bash
-rtk cargo build -p decibel-dataset -p decibel-admin --features rocksdb --release
-rtk ./scripts/import-real-data.sh rocksdb "$DATASET_ROOT" --bin-dir target/release
+rtk cargo build -p decibel-dataset -p decibel-admin --features rocksdb --release --target-dir target/rocksdb
+rtk ./scripts/import-real-data.sh rocksdb "$DATASET_ROOT" --bin-dir target/rocksdb/release
 ```
 
 The script normalizes `$DATASET_ROOT/raw/transactions_*.pb.zst` into tx-only normalized artifacts, replays them into `$DATASET_ROOT/materialized/rocksdb`, and writes `$DATASET_ROOT/reports/rocksdb-checksums.json`.
@@ -285,88 +285,36 @@ rtk cargo run -p decibel-admin --features rocksdb -- checksum \
   --out "$DATASET_ROOT/reports/rocksdb-checksums.json"
 ```
 
-## 7. ToplingDB Server Configuration
+## 7. ToplingDB Worktree
 
-Decibel follows the same integration strategy as `sui-hotstore`: use the RocksDB-compatible Rust API, and patch the `rocksdb` crate to `topling/rust-toplingdb` only in the server worktree used for ToplingDB runs.
+ToplingDB runs use the sibling `/Users/ssyuan/work/project/decibel-hotindex-topingdb`
+worktree on branch `topingdb`. The clean `main` worktree remains the RocksDB
+baseline and must not contain the `rust-toplingdb` cargo patch.
 
-Current Decibel code support:
-
-- `decibel-hotindex-storage --features toplingsdb`
-- `decibel-dataset --features toplingsdb`
-- `decibel-admin --features toplingsdb`
-- `decibel-hotindex-bench --features toplingsdb`
-- `TOPLINGDB_EASY_MIGRATE_CONF` is required and must point to a readable YAML config.
-
-Create a dedicated branch/worktree for ToplingDB so the RocksDB baseline stays clean:
+Use [Backend Worktrees](BACKEND_WORKTREES.md) as the canonical workflow. The
+short server version is:
 
 ```bash
-git switch -c codex/toplingdb-server
-```
+# main worktree
+rtk ./scripts/check-backend-isolation.sh rocksdb
+rtk cargo build -p decibel-dataset -p decibel-admin --features rocksdb --release --target-dir target/rocksdb
+rtk ./scripts/import-real-data.sh rocksdb "$DATASET_ROOT" --bin-dir target/rocksdb/release
 
-Patch root `Cargo.toml` on that branch:
-
-```toml
-[patch.crates-io]
-rocksdb = { git = "https://github.com/topling/rust-toplingdb", rev = "5390ceb77bebba1bf2720b052f83f82b864d64df" }
-```
-
-Use the same revision as `sui-hotstore` unless we intentionally update both projects together.
-
-Set the ToplingDB config:
-
-```bash
+# topingdb worktree
+cd /Users/ssyuan/work/project/decibel-hotindex-topingdb
 export TOPLINGDB_EASY_MIGRATE_CONF=/path/to/sui/crates/typed-store/config/topling_sui.yaml
-test -f "$TOPLINGDB_EASY_MIGRATE_CONF"
-```
-
-If the server does not have a Sui checkout with `topling_sui.yaml`, copy that config from the Sui/ToplingDB environment used by `sui-hotstore`. Do not invent a config silently; record the exact config path and sha256 in benchmark notes.
-
-Build checks:
-
-```bash
-rtk cargo check -p decibel-hotindex-storage --features toplingsdb
-rtk cargo check -p decibel-dataset --features toplingsdb
-rtk cargo check -p decibel-admin --features toplingsdb
-rtk cargo check -p decibel-hotindex-bench --features toplingsdb
-```
-
-ToplingDB import:
-
-```bash
-rtk cargo build -p decibel-dataset -p decibel-admin --features toplingsdb --release
+rtk ./scripts/check-backend-isolation.sh toplingdb
+rtk cargo build -p decibel-dataset -p decibel-admin --features toplingsdb --release --target-dir target/topingdb
 rtk ./scripts/import-real-data.sh toplingdb "$DATASET_ROOT" \
-  --bin-dir target/release \
+  --bin-dir target/topingdb/release \
   --toplingdb-conf "$TOPLINGDB_EASY_MIGRATE_CONF"
 ```
 
-To import both backends and compare checksums:
+If the server does not have a Sui checkout with `topling_sui.yaml`, copy that
+config from the Sui/ToplingDB environment used by `sui-hotstore`. Do not invent a
+config silently; record the exact config path and sha256 in benchmark notes.
 
-```bash
-rtk cargo build -p decibel-dataset -p decibel-admin --features toplingsdb --release
-rtk ./scripts/import-real-data.sh both "$DATASET_ROOT" \
-  --bin-dir target/release \
-  --toplingdb-conf "$TOPLINGDB_EASY_MIGRATE_CONF"
-```
-
-Manual ToplingDB replay:
-
-```bash
-rtk cargo run -p decibel-dataset --features toplingsdb -- replay \
-  --dataset "$DATASET_ROOT" \
-  --engine toplingdb \
-  --db-path "$DATASET_ROOT/materialized/toplingdb"
-```
-
-ToplingDB checksum:
-
-```bash
-rtk cargo run -p decibel-admin --features toplingsdb -- checksum \
-  --engine toplingdb \
-  --db-path "$DATASET_ROOT/materialized/toplingdb" \
-  --out "$DATASET_ROOT/reports/toplingdb-checksums.json"
-```
-
-Compare:
+Compare checksums only after both isolated imports complete:
 
 ```bash
 rtk cargo run -p decibel-admin -- compare-checksum \
@@ -376,34 +324,34 @@ rtk cargo run -p decibel-admin -- compare-checksum \
 
 ## 8. Benchmark Commands
 
-Serving benchmark:
+RocksDB serving benchmark from `main`:
 
 ```bash
-rtk cargo run -p decibel-hotindex-bench --features rocksdb -- run \
+rtk cargo build -p decibel-hotindex-bench --features rocksdb --release --target-dir target/rocksdb
+rtk ./scripts/run-benchmark-suite.sh \
+  --backend rocksdb \
   --dataset "$DATASET_ROOT" \
-  --engine rocksdb \
-  --db-path "$DATASET_ROOT/materialized/rocksdb" \
-  --class serving \
-  --workload mixed_market_dashboard \
+  --bin-dir target/rocksdb/release \
+  --workloads get_tx_by_version,multi_get_tx_versions_100 \
   --iterations 100000 \
-  --warmup 1000 \
-  --expected-checksum "$DATASET_ROOT/reports/rocksdb-checksums.json" \
-  --out "$DATASET_ROOT/reports/bench-rocksdb-serving.json"
+  --warmup 1000
 ```
 
-ToplingDB serving benchmark:
+ToplingDB serving benchmark from `topingdb`:
 
 ```bash
-rtk cargo run -p decibel-hotindex-bench --features toplingsdb -- run \
+cd /Users/ssyuan/work/project/decibel-hotindex-topingdb
+export TOPLINGDB_EASY_MIGRATE_CONF=/path/to/sui/crates/typed-store/config/topling_sui.yaml
+rtk cargo build -p decibel-hotindex-bench --features toplingsdb --release --target-dir target/topingdb
+rtk ./scripts/run-benchmark-suite.sh \
+  --backend toplingdb \
   --dataset "$DATASET_ROOT" \
-  --engine toplingdb \
-  --db-path "$DATASET_ROOT/materialized/toplingdb" \
-  --class serving \
-  --workload mixed_market_dashboard \
+  --bin-dir target/topingdb/release \
+  --workloads get_tx_by_version,multi_get_tx_versions_100 \
   --iterations 100000 \
   --warmup 1000 \
   --expected-checksum "$DATASET_ROOT/reports/rocksdb-checksums.json" \
-  --out "$DATASET_ROOT/reports/bench-toplingdb-serving.json"
+  --toplingdb-conf "$TOPLINGDB_EASY_MIGRATE_CONF"
 ```
 
 Summary:

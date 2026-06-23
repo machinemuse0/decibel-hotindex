@@ -21,7 +21,7 @@ decibel-hotindex-core = { path = "crates/decibel-hotindex-core" }
 decibel-hotindex-ingest = { path = "crates/decibel-hotindex-ingest" }
 decibel-hotindex-storage = { path = "crates/decibel-hotindex-storage", default-features = false }
 prost = "0.13.4"
-rocksdb = { version = "0.24.0", default-features = false, features = ["lz4"] }
+rocksdb = { version = "0.22.0", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -40,3 +40,6 @@ zstd = "0.13"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+[patch.crates-io]
+rocksdb = { git = "https://github.com/topling/rust-toplingdb", rev = "5390ceb77bebba1bf2720b052f83f82b864d64df" }
