@@ -1,14 +1,17 @@
 use aptos_protos::{
     indexer::v1::{raw_data_client::RawDataClient, GetTransactionsRequest},
-    transaction::v1::Transaction,
+    transaction::v1::{transaction::TxnData, Event, Transaction},
 };
 use decibel_hotindex_core::{
     normalize_aptos_address, ActivityRow, AppConfig, BuilderAttributionRow, DatasetEncoding,
     DatasetFileHashes, DatasetId, DatasetManifest, DecibelEventPayload, DecibelEventType, FillRow,
     HotIndexError, IngestCheckpoint, Network, NormalizedEvent, OrderRow, PositionRow,
-    QueryCorpusRecord, QueryKind, Result, TxRow,
+    QueryCorpusRecord, QueryKind, Result, TxRow, LOGICAL_SCHEMA_VERSION,
 };
-use decibel_hotindex_ingest::{parse_fixture_jsonl_file, ParserOptions, ParserOutput};
+use decibel_hotindex_ingest::{
+    parse_decibel_event_from_parts, parse_fixture_jsonl_file, DecibelEventInput, ParserOptions,
+    ParserOutput,
+};
 #[cfg(feature = "rocksdb")]
 use decibel_hotindex_storage::RocksDbEngine;
 use decibel_hotindex_storage::{MemoryEngine, StorageEngine};
@@ -186,15 +189,15 @@ fn build_query_corpus_command(args: &[String]) -> Result<()> {
     let _seed = opts.optional_u64("--seed")?.unwrap_or(42);
 
     fs::create_dir_all(&out_dir)?;
-    let records = read_ndjson::<NormalizedEvent>(&events)?;
-    if records.is_empty() {
+    let rows = query_corpus_rows_from_events_path(&events)?;
+    if rows.events.is_empty() && rows.txs.is_empty() {
         return Err(HotIndexError::Config(format!(
-            "no normalized Decibel events found in {}; real Aptos protobuf normalization is currently tx-only, so use fixture/synthetic data for Decibel serving workloads until event extraction lands",
+            "no normalized events or tx rows found in {}; use a normalized dataset directory with Decibel-active rows or recorded tx keys",
             events.display(),
         )));
     }
 
-    let corpus = build_query_corpus(&records);
+    let corpus = build_query_corpus(&rows.as_refs());
     write_query_corpus_files(&out_dir, &corpus)?;
     update_manifest_query_hashes_if_present(&out_dir)?;
 
@@ -221,10 +224,7 @@ fn replay_command(args: &[String]) -> Result<()> {
                 .optional_value("--db-path")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| dataset.join("materialized/rocksdb"));
-            let engine = RocksDbEngine::open(&db_path)?;
-            replay_into_engine(&dataset, &engine)?;
-            print_replay_result(&engine)?;
-            println!("rocksdb path={}", db_path.display());
+            replay_rocksdb_materialized(&dataset, db_path)?;
         }
         #[cfg(not(feature = "rocksdb"))]
         "rocksdb" => {
@@ -244,6 +244,59 @@ fn replay_command(args: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "rocksdb")]
+fn replay_rocksdb_materialized(dataset: &Path, db_path: PathBuf) -> Result<()> {
+    if db_path.exists() {
+        return Err(HotIndexError::Config(format!(
+            "rocksdb replay db path already exists: {}; remove it or choose a new --db-path",
+            db_path.display()
+        )));
+    }
+    let staging_path = staging_materialized_path(&db_path, "rocksdb")?;
+    if staging_path.exists() {
+        return Err(HotIndexError::Config(format!(
+            "rocksdb replay staging path already exists: {}; remove stale staging output before retrying",
+            staging_path.display()
+        )));
+    }
+    if let Some(parent) = db_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let result = (|| {
+        let engine = RocksDbEngine::open(&staging_path)?;
+        replay_into_engine(dataset, &engine)?;
+        print_replay_result(&engine)?;
+        engine.flush_all()?;
+        drop(engine);
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_dir_all(&staging_path);
+        return Err(error);
+    }
+
+    sync_parent_dir(&staging_path)?;
+    fs::rename(&staging_path, &db_path)?;
+    sync_parent_dir(&db_path)?;
+    println!("rocksdb path={}", db_path.display());
+    Ok(())
+}
+
+#[cfg(feature = "rocksdb")]
+fn staging_materialized_path(final_path: &Path, backend: &str) -> Result<PathBuf> {
+    let name = final_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            HotIndexError::Config(format!(
+                "{backend} replay db path has no final directory name: {}",
+                final_path.display()
+            ))
+        })?;
+    Ok(final_path.with_file_name(format!(".{name}.staging.{}", std::process::id())))
 }
 
 fn normalize_command(args: &[String]) -> Result<()> {
@@ -267,9 +320,15 @@ fn normalize_command(args: &[String]) -> Result<()> {
         let parser_options = parser_options_from_args(&opts, &dataset_root)?;
         let raw_inputs = resolve_protobuf_raw_inputs(&input)?;
         let raw_input_count = raw_inputs.len();
-        normalize_protobuf_tx_only(&dataset_root, &out_dir, &raw_inputs, &parser_options)?;
+        normalize_protobuf_tx_only(
+            &dataset_root,
+            &out_dir,
+            &raw_inputs,
+            &parser_options,
+            input.is_dir(),
+        )?;
         println!(
-            "normalized Aptos protobuf tx-only dataset written at {} from {} raw chunk(s)",
+            "normalized Aptos protobuf dataset written at {} from {} raw chunk(s)",
             out_dir.display(),
             raw_input_count
         );
@@ -534,6 +593,11 @@ fn infer_record_resume_state_from_chunks(out_dir: &Path) -> Result<Option<Record
     }
 
     ranges.sort_by_key(|(first_version, last_version, _)| (*first_version, *last_version));
+    let chunk_paths = ranges
+        .iter()
+        .map(|(_, _, path)| path.clone())
+        .collect::<Vec<_>>();
+    validate_declared_raw_chunk_sequence(&chunk_paths, true)?;
     let last_success_version = ranges
         .iter()
         .map(|(_, last_version, _)| *last_version)
@@ -798,16 +862,18 @@ async fn record_live_transaction_stream(request: LiveRecordRequest) -> Result<Re
                     let key_report = key_writer.finish(&request, last_success_version)?;
                     write_record_checkpoint(
                         &request,
-                        "partial",
-                        "recorded partial Aptos Transaction Stream raw protobuf chunks before stream interruption",
-                        chain_id,
-                        count,
-                        uncompressed_raw_bytes,
-                        last_success_version,
-                        &chunks,
-                        Some(key_report),
-                        stopped_at_byte_limit,
-                        Some(stream_error.as_str()),
+                        RecordCheckpointInput {
+                            status: "partial",
+                            message: "recorded partial Aptos Transaction Stream raw protobuf chunks before stream interruption",
+                            chain_id,
+                            run_transaction_count: count,
+                            uncompressed_raw_bytes,
+                            last_success_version,
+                            chunks: &chunks,
+                            key_report: Some(key_report),
+                            stopped_at_byte_limit,
+                            stream_error: Some(stream_error.as_str()),
+                        },
                     )?;
                     return Ok(RecordRunOutcome::Interrupted {
                         next_start_version: checked_next_version(last_success_version)?,
@@ -862,16 +928,18 @@ async fn record_live_transaction_stream(request: LiveRecordRequest) -> Result<Re
                 );
                 write_record_checkpoint(
                     &request,
-                    "recording",
-                    "recorded Aptos Transaction Stream raw protobuf chunk; recording still in progress",
-                    chain_id,
-                    count,
-                    uncompressed_raw_bytes,
-                    last_success_version,
-                    &chunks,
-                    None,
-                    stopped_at_byte_limit,
-                    None,
+                    RecordCheckpointInput {
+                        status: "recording",
+                        message: "recorded Aptos Transaction Stream raw protobuf chunk; recording still in progress",
+                        chain_id,
+                        run_transaction_count: count,
+                        uncompressed_raw_bytes,
+                        last_success_version,
+                        chunks: &chunks,
+                        key_report: None,
+                        stopped_at_byte_limit,
+                        stream_error: None,
+                    },
                 )?;
             }
 
@@ -917,16 +985,18 @@ async fn record_live_transaction_stream(request: LiveRecordRequest) -> Result<Re
     };
     write_record_checkpoint(
         &request,
-        "complete",
-        message,
-        chain_id,
-        count,
-        uncompressed_raw_bytes,
-        last_success_version,
-        &chunks,
-        Some(key_report),
-        stopped_at_byte_limit,
-        None,
+        RecordCheckpointInput {
+            status: "complete",
+            message,
+            chain_id,
+            run_transaction_count: count,
+            uncompressed_raw_bytes,
+            last_success_version,
+            chunks: &chunks,
+            key_report: Some(key_report),
+            stopped_at_byte_limit,
+            stream_error: None,
+        },
     )?;
     println!(
         "recorded transaction stream: tx={} range={}..{} raw_bytes={} next_start_version={}",
@@ -1197,28 +1267,32 @@ impl ActiveTransactionChunkWriter {
     }
 }
 
-fn write_record_checkpoint(
-    request: &LiveRecordRequest,
-    status: &str,
-    message: &str,
+struct RecordCheckpointInput<'a> {
+    status: &'a str,
+    message: &'a str,
     chain_id: Option<u64>,
     run_transaction_count: u64,
     uncompressed_raw_bytes: u64,
     last_success_version: u64,
-    chunks: &[serde_json::Value],
+    chunks: &'a [serde_json::Value],
     key_report: Option<serde_json::Value>,
     stopped_at_byte_limit: bool,
-    stream_error: Option<&str>,
+    stream_error: Option<&'a str>,
+}
+
+fn write_record_checkpoint(
+    request: &LiveRecordRequest,
+    input: RecordCheckpointInput<'_>,
 ) -> Result<()> {
-    let total_transaction_count = chunks.iter().try_fold(0_u64, |acc, chunk| {
+    let total_transaction_count = input.chunks.iter().try_fold(0_u64, |acc, chunk| {
         acc.checked_add(chunk_transaction_count(chunk))
             .ok_or_else(|| {
                 HotIndexError::Config("checkpoint transaction count overflow".to_string())
             })
     })?;
     let mut checkpoint = serde_json::json!({
-        "status": status,
-        "message": message,
+        "status": input.status,
+        "message": input.message,
         "network": request.network.as_str(),
         "endpoint": request.endpoint.as_str(),
         "package_address": request.package_address.as_str(),
@@ -1231,23 +1305,23 @@ fn write_record_checkpoint(
         "resume": request.resume,
         "raw_format": request.raw_format.as_str(),
         "auth_token_present": true,
-        "chain_id": chain_id,
-        "run_transaction_count": run_transaction_count,
+        "chain_id": input.chain_id,
+        "run_transaction_count": input.run_transaction_count,
         "transaction_count": total_transaction_count,
-        "uncompressed_raw_bytes": uncompressed_raw_bytes,
+        "uncompressed_raw_bytes": input.uncompressed_raw_bytes,
         "max_raw_bytes": request.max_raw_bytes,
         "chunk_transaction_count": request.chunk_transaction_count,
-        "last_success_version": last_success_version,
-        "next_start_version": checked_next_version(last_success_version)?,
-        "stopped_at_byte_limit": stopped_at_byte_limit,
-        "chunks": chunks,
+        "last_success_version": input.last_success_version,
+        "next_start_version": checked_next_version(input.last_success_version)?,
+        "stopped_at_byte_limit": input.stopped_at_byte_limit,
+        "chunks": input.chunks,
     });
 
     if let serde_json::Value::Object(object) = &mut checkpoint {
-        if let Some(key_report) = key_report {
+        if let Some(key_report) = input.key_report {
             object.insert("key_files".to_string(), key_report);
         }
-        if let Some(stream_error) = stream_error {
+        if let Some(stream_error) = input.stream_error {
             object.insert(
                 "stream_error".to_string(),
                 serde_json::Value::String(stream_error.to_string()),
@@ -1576,7 +1650,12 @@ fn write_synthetic_dataset(root: &Path, dataset: &SyntheticDataset) -> Result<()
     write_ndjson::<NormalizedEvent>(&normalized.join("unknown_events.ndjson"), &[])?;
     write_text(&normalized.join("parse_warnings.log"), "")?;
 
-    let corpus = build_query_corpus(&dataset.events);
+    let corpus = build_query_corpus(&QueryCorpusRows {
+        txs: &dataset.txs,
+        events: &dataset.events,
+        fills: &dataset.fills,
+        builder_rows: &dataset.builder_rows,
+    });
     write_query_corpus_files(&queries, &corpus)?;
 
     let mut hashes = BTreeMap::new();
@@ -1589,6 +1668,7 @@ fn write_synthetic_dataset(root: &Path, dataset: &SyntheticDataset) -> Result<()
 
     let manifest = DatasetManifest {
         dataset_id: DatasetId("synthetic_smoke".to_string()),
+        schema_version: LOGICAL_SCHEMA_VERSION,
         network: Network::Local,
         source: "synthetic".to_string(),
         transaction_stream_endpoint: None,
@@ -1626,6 +1706,7 @@ fn replay_into_memory(root: &Path) -> Result<MemoryEngine> {
 fn replay_into_engine<E: StorageEngine>(root: &Path, engine: &E) -> Result<()> {
     let normalized = root.join("normalized");
     let manifest = read_json::<DatasetManifest>(&root.join("manifest.json"))?;
+    validate_manifest_schema_version(&manifest)?;
     validate_manifest_hashes(root, &manifest)?;
 
     replay_ndjson_rows(&normalized.join("txs.ndjson"), |tx: TxRow| {
@@ -1757,6 +1838,7 @@ fn write_normalized_fixture_dataset(
     let end_version = rows.txs.iter().map(|tx| tx.version).max();
     let manifest = DatasetManifest {
         dataset_id: parser_options.dataset_id.clone(),
+        schema_version: LOGICAL_SCHEMA_VERSION,
         network: parser_options.network,
         source: "fixture_jsonl".to_string(),
         transaction_stream_endpoint: None,
@@ -1785,39 +1867,60 @@ fn normalize_protobuf_tx_only(
     normalized_dir: &Path,
     raw_inputs: &[PathBuf],
     parser_options: &ParserOptions,
+    require_contiguous_chunks: bool,
 ) -> Result<()> {
     if raw_inputs.is_empty() {
         return Err(HotIndexError::Config(
             "no protobuf raw inputs were provided".to_string(),
         ));
     }
+    validate_declared_raw_chunk_sequence(raw_inputs, require_contiguous_chunks)?;
 
     fs::create_dir_all(normalized_dir)?;
     let txs_path = normalized_dir.join("txs.ndjson");
 
     let mut first_version = None;
     let mut last_version = None;
-    let mut previous_decoded_version = None;
     let mut decoded_tx_count = 0_u64;
     let mut unique_tx_count = 0_u64;
-    let mut duplicate_tx_count = 0_u64;
-    let mut out_of_order_tx_count = 0_u64;
     let mut seen_versions = BTreeSet::new();
+    let mut parser_output = ParserOutput::default();
     atomic_write(&txs_path, |tx_writer| {
         for raw_input in raw_inputs {
+            let declared_range = raw_chunk_version_range(raw_input);
+            let mut chunk_first_version = None;
+            let mut chunk_last_version = None;
+            let mut chunk_transaction_count = 0_u64;
+            let mut previous_chunk_version = None;
             let mut decoder = zstd::stream::read::Decoder::new(File::open(raw_input)?)?;
             while let Some(transaction) = read_next_len_delimited_transaction(&mut decoder)? {
-                decoded_tx_count += 1;
-                if let Some(previous_version) = previous_decoded_version {
-                    if transaction.version <= previous_version {
-                        out_of_order_tx_count += 1;
+                if let Some(previous_version) = previous_chunk_version {
+                    let expected_version = checked_next_version(previous_version)?;
+                    if transaction.version != expected_version {
+                        return Err(HotIndexError::Config(format!(
+                            "non-contiguous transaction version in raw chunk {}: expected {}, got {}",
+                            raw_input.display(),
+                            expected_version,
+                            transaction.version
+                        )));
                     }
                 }
-                previous_decoded_version = Some(transaction.version);
+                previous_chunk_version = Some(transaction.version);
+                chunk_first_version.get_or_insert(transaction.version);
+                chunk_last_version = Some(transaction.version);
+                chunk_transaction_count =
+                    chunk_transaction_count.checked_add(1).ok_or_else(|| {
+                        HotIndexError::Config(
+                            "raw chunk transaction count overflowed u64".to_string(),
+                        )
+                    })?;
+                decoded_tx_count += 1;
 
                 if !seen_versions.insert(transaction.version) {
-                    duplicate_tx_count += 1;
-                    continue;
+                    return Err(HotIndexError::Config(format!(
+                        "duplicate transaction version {} across protobuf raw chunks",
+                        transaction.version
+                    )));
                 }
 
                 first_version = Some(first_version.map_or(transaction.version, |version: u64| {
@@ -1827,31 +1930,74 @@ fn normalize_protobuf_tx_only(
                     version.max(transaction.version)
                 }));
                 let row = tx_row_from_transaction(&transaction, parser_options);
+                parse_protobuf_decibel_events(&transaction, parser_options, &mut parser_output)?;
                 serde_json::to_writer(&mut *tx_writer, &row).map_err(json_error)?;
                 tx_writer.write_all(b"\n")?;
+                parser_output.txs.push(row);
                 unique_tx_count += 1;
             }
+            validate_decoded_raw_chunk(
+                raw_input,
+                declared_range,
+                chunk_first_version,
+                chunk_last_version,
+                chunk_transaction_count,
+            )?;
         }
         Ok(())
     })?;
 
-    write_ndjson::<NormalizedEvent>(&normalized_dir.join("events.ndjson"), &[])?;
-    write_ndjson::<FillRow>(&normalized_dir.join("fills.ndjson"), &[])?;
-    write_ndjson::<OrderRow>(&normalized_dir.join("orders.ndjson"), &[])?;
-    write_ndjson::<PositionRow>(&normalized_dir.join("positions.ndjson"), &[])?;
-    write_ndjson::<BuilderAttributionRow>(&normalized_dir.join("builder_code_rows.ndjson"), &[])?;
-    write_ndjson::<ActivityRow>(&normalized_dir.join("activity_rows.ndjson"), &[])?;
-    write_ndjson::<NormalizedEvent>(&normalized_dir.join("unknown_events.ndjson"), &[])?;
-    write_text(
-        &normalized_dir.join("parse_warnings.log"),
-        &format!(
-            "tx-only protobuf normalization: Decibel event extraction is pending\n\
+    write_ndjson(&normalized_dir.join("events.ndjson"), &parser_output.events)?;
+    write_ndjson(&normalized_dir.join("fills.ndjson"), &parser_output.fills)?;
+    write_ndjson(&normalized_dir.join("orders.ndjson"), &parser_output.orders)?;
+    write_ndjson(
+        &normalized_dir.join("positions.ndjson"),
+        &parser_output.positions,
+    )?;
+    write_ndjson(
+        &normalized_dir.join("builder_code_rows.ndjson"),
+        &parser_output.builder_rows,
+    )?;
+    write_ndjson(
+        &normalized_dir.join("activity_rows.ndjson"),
+        &parser_output.activity_rows,
+    )?;
+    write_ndjson(
+        &normalized_dir.join("unknown_events.ndjson"),
+        &parser_output.unknown_events,
+    )?;
+    let query_corpus = build_query_corpus(&QueryCorpusRows {
+        txs: &parser_output.txs,
+        events: &parser_output.events,
+        fills: &parser_output.fills,
+        builder_rows: &parser_output.builder_rows,
+    });
+    if !query_corpus.is_empty() {
+        write_query_corpus_files(&dataset_root.join("queries"), &query_corpus)?;
+    }
+    let mut parse_warnings = format!(
+        "protobuf normalization with Decibel event extraction\n\
 decoded_transactions={decoded_tx_count}\n\
 unique_transactions={unique_tx_count}\n\
-duplicate_transactions_skipped={duplicate_tx_count}\n\
-out_of_order_or_duplicate_transitions={out_of_order_tx_count}\n"
-        ),
-    )?;
+decibel_events={}\n\
+fills={}\n\
+orders={}\n\
+positions={}\n\
+builder_rows={}\n\
+unknown_events={}\n\
+integrity_enforced=true\n",
+        parser_output.events.len(),
+        parser_output.fills.len(),
+        parser_output.orders.len(),
+        parser_output.positions.len(),
+        parser_output.builder_rows.len(),
+        parser_output.unknown_events.len()
+    );
+    for warning in &parser_output.warnings {
+        parse_warnings.push_str(warning);
+        parse_warnings.push('\n');
+    }
+    write_text(&normalized_dir.join("parse_warnings.log"), &parse_warnings)?;
 
     let mut hashes = BTreeMap::new();
     for raw_input in raw_inputs {
@@ -1869,6 +2015,7 @@ out_of_order_or_duplicate_transitions={out_of_order_tx_count}\n"
 
     let manifest = DatasetManifest {
         dataset_id: parser_options.dataset_id.clone(),
+        schema_version: LOGICAL_SCHEMA_VERSION,
         network: parser_options.network,
         source: "aptos_transaction_stream".to_string(),
         transaction_stream_endpoint: None,
@@ -1878,15 +2025,15 @@ out_of_order_or_duplicate_transitions={out_of_order_tx_count}\n"
         end_version: last_version,
         package_address: parser_options.package_address.clone(),
         orderbook_address: parser_options.orderbook_address.clone(),
-        parser_source: Some("decibel-dataset tx-only protobuf normalizer".to_string()),
+        parser_source: Some("decibel-dataset protobuf normalizer".to_string()),
         parser_commit: parser_options.parser_commit.clone(),
         captured_at: Some(current_epoch_string()),
         raw_transaction_count: unique_tx_count,
-        decibel_event_count: 0,
-        fill_count: 0,
-        order_count: 0,
-        position_count: 0,
-        builder_code_row_count: 0,
+        decibel_event_count: parser_output.events.len() as u64,
+        fill_count: parser_output.fills.len() as u64,
+        order_count: parser_output.orders.len() as u64,
+        position_count: parser_output.positions.len() as u64,
+        builder_code_row_count: parser_output.builder_rows.len() as u64,
         hashes: DatasetFileHashes { sha256: hashes },
     };
     write_json_pretty(&dataset_root.join("manifest.json"), &manifest)
@@ -1905,6 +2052,53 @@ fn tx_row_from_transaction(transaction: &Transaction, parser_options: &ParserOpt
             transaction.r#type, transaction.epoch, transaction.block_height
         )),
     }
+}
+
+fn parse_protobuf_decibel_events(
+    transaction: &Transaction,
+    parser_options: &ParserOptions,
+    output: &mut ParserOutput,
+) -> Result<()> {
+    let tx_hash = transaction_hash_hex(transaction);
+    let timestamp_us = transaction_timestamp_us(transaction);
+    for (idx, event) in protobuf_transaction_events(transaction).iter().enumerate() {
+        let event_idx = idx.try_into().unwrap_or(u32::MAX);
+        let data = parse_protobuf_event_data(event)?;
+        parse_decibel_event_from_parts(
+            DecibelEventInput {
+                raw_type: event.type_str.clone(),
+                data,
+                version: transaction.version,
+                tx_hash: tx_hash.clone(),
+                block_timestamp_us: timestamp_us,
+                event_idx,
+            },
+            parser_options,
+            output,
+        )?;
+    }
+    Ok(())
+}
+
+fn protobuf_transaction_events(transaction: &Transaction) -> &[Event] {
+    match transaction.txn_data.as_ref() {
+        Some(TxnData::BlockMetadata(txn)) => &txn.events,
+        Some(TxnData::Genesis(txn)) => &txn.events,
+        Some(TxnData::User(txn)) => &txn.events,
+        _ => &[],
+    }
+}
+
+fn parse_protobuf_event_data(event: &Event) -> Result<serde_json::Value> {
+    if event.data.trim().is_empty() {
+        return Ok(serde_json::Value::Object(Default::default()));
+    }
+    serde_json::from_str(&event.data).map_err(|error| {
+        HotIndexError::Parse(format!(
+            "protobuf event {} data is not JSON: {error}",
+            event.type_str
+        ))
+    })
 }
 
 fn transaction_hash_hex(transaction: &Transaction) -> String {
@@ -1927,8 +2121,6 @@ fn transaction_timestamp_us(transaction: &Transaction) -> u64 {
 }
 
 fn transaction_event_count(transaction: &Transaction) -> u32 {
-    use aptos_protos::transaction::v1::transaction::TxnData;
-
     let count = match transaction.txn_data.as_ref() {
         Some(TxnData::BlockMetadata(txn)) => txn.events.len(),
         Some(TxnData::Genesis(txn)) => txn.events.len(),
@@ -2027,8 +2219,19 @@ fn update_manifest_query_hashes_if_present(query_dir: &Path) -> Result<()> {
     write_json_pretty(&manifest_path, &manifest)
 }
 
+fn validate_manifest_schema_version(manifest: &DatasetManifest) -> Result<()> {
+    if manifest.schema_version != LOGICAL_SCHEMA_VERSION {
+        return Err(HotIndexError::Config(format!(
+            "dataset schema_version {} is unsupported; expected {}. Rebuild normalized artifacts from raw data.",
+            manifest.schema_version, LOGICAL_SCHEMA_VERSION
+        )));
+    }
+    Ok(())
+}
+
 fn validate_manifest_hashes(root: &Path, manifest: &DatasetManifest) -> Result<()> {
     for (relative, expected) in &manifest.hashes.sha256 {
+        validate_manifest_artifact_key(relative)?;
         let path = root.join(relative);
         let actual = sha256_file(&path).map_err(|error| {
             HotIndexError::Config(format!(
@@ -2041,6 +2244,21 @@ fn validate_manifest_hashes(root: &Path, manifest: &DatasetManifest) -> Result<(
                 "sha256 mismatch for {relative}: expected {expected}, got {actual}"
             )));
         }
+    }
+    Ok(())
+}
+
+fn validate_manifest_artifact_key(relative: &str) -> Result<()> {
+    let path = Path::new(relative);
+    if path.is_absolute()
+        || relative.is_empty()
+        || relative
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(HotIndexError::Config(format!(
+            "dataset manifest contains invalid artifact path: {relative}"
+        )));
     }
     Ok(())
 }
@@ -2058,18 +2276,93 @@ fn artifact_key(root: &Path, path: &Path) -> String {
         .to_string()
 }
 
-fn build_query_corpus(events: &[NormalizedEvent]) -> Vec<QueryCorpusRecord> {
+struct QueryCorpusRows<'a> {
+    txs: &'a [TxRow],
+    events: &'a [NormalizedEvent],
+    fills: &'a [FillRow],
+    builder_rows: &'a [BuilderAttributionRow],
+}
+
+struct OwnedQueryCorpusRows {
+    txs: Vec<TxRow>,
+    events: Vec<NormalizedEvent>,
+    fills: Vec<FillRow>,
+    builder_rows: Vec<BuilderAttributionRow>,
+}
+
+impl OwnedQueryCorpusRows {
+    fn as_refs(&self) -> QueryCorpusRows<'_> {
+        QueryCorpusRows {
+            txs: &self.txs,
+            events: &self.events,
+            fills: &self.fills,
+            builder_rows: &self.builder_rows,
+        }
+    }
+}
+
+fn query_corpus_rows_from_events_path(events_path: &Path) -> Result<OwnedQueryCorpusRows> {
+    let events = read_ndjson::<NormalizedEvent>(events_path)?;
+    let normalized_dir = events_path.parent().unwrap_or_else(|| Path::new("."));
+    let txs_path = normalized_dir.join("txs.ndjson");
+    let fills_path = normalized_dir.join("fills.ndjson");
+    let builder_rows_path = normalized_dir.join("builder_code_rows.ndjson");
+
+    let txs = if txs_path.exists() {
+        read_ndjson::<TxRow>(&txs_path)?
+    } else {
+        tx_rows_from_events(&events)
+    };
+    let fills = if fills_path.exists() {
+        read_ndjson::<FillRow>(&fills_path)?
+    } else {
+        Vec::new()
+    };
+    let builder_rows = if builder_rows_path.exists() {
+        read_ndjson::<BuilderAttributionRow>(&builder_rows_path)?
+    } else {
+        Vec::new()
+    };
+
+    Ok(OwnedQueryCorpusRows {
+        txs,
+        events,
+        fills,
+        builder_rows,
+    })
+}
+
+fn tx_rows_from_events(events: &[NormalizedEvent]) -> Vec<TxRow> {
+    let mut seen_versions = BTreeSet::new();
+    let mut txs = Vec::new();
+    for event in events {
+        if seen_versions.insert(event.version) {
+            txs.push(TxRow {
+                network: event.network,
+                version: event.version,
+                tx_hash: event.tx_hash.clone(),
+                block_timestamp_us: event.block_timestamp_us,
+                event_count: 1,
+                dataset_id: None,
+                raw_summary: Some("derived from normalized events for query corpus".to_string()),
+            });
+        }
+    }
+    txs
+}
+
+fn build_query_corpus(rows: &QueryCorpusRows<'_>) -> Vec<QueryCorpusRecord> {
     let mut corpus = Vec::new();
     let mut seen_versions = BTreeSet::new();
     let mut seen_markets = BTreeSet::new();
     let mut seen_accounts = BTreeSet::new();
     let mut seen_builders = BTreeSet::new();
 
-    for event in events {
-        if seen_versions.insert(event.version) {
+    for tx in rows.txs {
+        if seen_versions.insert(tx.version) {
             corpus.push(QueryCorpusRecord {
                 query_kind: QueryKind::GetTxByVersion,
-                tx_version: Some(event.version),
+                tx_version: Some(tx.version),
                 tx_versions: Vec::new(),
                 market_id: None,
                 account: None,
@@ -2077,53 +2370,69 @@ fn build_query_corpus(events: &[NormalizedEvent]) -> Vec<QueryCorpusRecord> {
                 limit: None,
             });
         }
-        if let Some(market_id) = &event.market_id {
-            if seen_markets.insert(market_id.clone()) {
+    }
+
+    if rows.txs.is_empty() {
+        for event in rows.events {
+            if seen_versions.insert(event.version) {
                 corpus.push(QueryCorpusRecord {
-                    query_kind: QueryKind::MarketFillScan,
-                    tx_version: None,
+                    query_kind: QueryKind::GetTxByVersion,
+                    tx_version: Some(event.version),
                     tx_versions: Vec::new(),
-                    market_id: Some(market_id.clone()),
+                    market_id: None,
                     account: None,
                     builder_addr: None,
-                    limit: Some(100),
-                });
-            }
-        }
-        if let Some(account) = &event.account {
-            if seen_accounts.insert(account.clone()) {
-                corpus.push(QueryCorpusRecord {
-                    query_kind: QueryKind::AccountFillScan,
-                    tx_version: None,
-                    tx_versions: Vec::new(),
-                    market_id: None,
-                    account: Some(account.clone()),
-                    builder_addr: None,
-                    limit: Some(100),
-                });
-            }
-        }
-        if let Some(builder_addr) = &event.builder_addr {
-            if seen_builders.insert(builder_addr.clone()) {
-                corpus.push(QueryCorpusRecord {
-                    query_kind: QueryKind::BuilderCodeFillScan,
-                    tx_version: None,
-                    tx_versions: Vec::new(),
-                    market_id: None,
-                    account: None,
-                    builder_addr: Some(builder_addr.clone()),
-                    limit: Some(100),
-                });
-                corpus.push(QueryCorpusRecord {
-                    query_kind: QueryKind::BuilderCodeVolume,
-                    tx_version: None,
-                    tx_versions: Vec::new(),
-                    market_id: None,
-                    account: None,
-                    builder_addr: Some(builder_addr.clone()),
                     limit: None,
                 });
             }
+        }
+    }
+
+    for fill in rows.fills {
+        if seen_markets.insert(fill.market_id.clone()) {
+            corpus.push(QueryCorpusRecord {
+                query_kind: QueryKind::MarketFillScan,
+                tx_version: None,
+                tx_versions: Vec::new(),
+                market_id: Some(fill.market_id.clone()),
+                account: None,
+                builder_addr: None,
+                limit: Some(100),
+            });
+        }
+        if seen_accounts.insert(fill.account.clone()) {
+            corpus.push(QueryCorpusRecord {
+                query_kind: QueryKind::AccountFillScan,
+                tx_version: None,
+                tx_versions: Vec::new(),
+                market_id: None,
+                account: Some(fill.account.clone()),
+                builder_addr: None,
+                limit: Some(100),
+            });
+        }
+    }
+
+    for row in rows.builder_rows {
+        if seen_builders.insert(row.builder_addr.clone()) {
+            corpus.push(QueryCorpusRecord {
+                query_kind: QueryKind::BuilderCodeFillScan,
+                tx_version: None,
+                tx_versions: Vec::new(),
+                market_id: None,
+                account: None,
+                builder_addr: Some(row.builder_addr.clone()),
+                limit: Some(100),
+            });
+            corpus.push(QueryCorpusRecord {
+                query_kind: QueryKind::BuilderCodeVolume,
+                tx_version: None,
+                tx_versions: Vec::new(),
+                market_id: None,
+                account: None,
+                builder_addr: Some(row.builder_addr.clone()),
+                limit: None,
+            });
         }
     }
 
@@ -2438,6 +2747,94 @@ fn infer_raw_format(path: &Path) -> &'static str {
     }
 }
 
+fn validate_declared_raw_chunk_sequence(
+    raw_inputs: &[PathBuf],
+    require_contiguous_chunks: bool,
+) -> Result<()> {
+    let mut previous_last_version = None;
+    for raw_input in raw_inputs {
+        let declared_range = raw_chunk_version_range(raw_input);
+        let Some((first_version, last_version)) = declared_range else {
+            if require_contiguous_chunks || raw_inputs.len() > 1 {
+                return Err(HotIndexError::Config(format!(
+                    "protobuf raw chunk {} must be named transactions_<first>_<last>.pb.zst",
+                    raw_input.display()
+                )));
+            }
+            continue;
+        };
+        if first_version > last_version {
+            return Err(HotIndexError::Config(format!(
+                "invalid raw chunk version range in {}: first_version {} is greater than last_version {}",
+                raw_input.display(),
+                first_version,
+                last_version
+            )));
+        }
+        if require_contiguous_chunks {
+            if let Some(previous_last) = previous_last_version {
+                let expected_first = checked_next_version(previous_last)?;
+                if first_version != expected_first {
+                    return Err(HotIndexError::Config(format!(
+                        "non-contiguous protobuf raw chunks: expected first_version {} after {}, got {} in {}",
+                        expected_first,
+                        previous_last,
+                        first_version,
+                        raw_input.display()
+                    )));
+                }
+            }
+            previous_last_version = Some(last_version);
+        }
+    }
+    Ok(())
+}
+
+fn validate_decoded_raw_chunk(
+    raw_input: &Path,
+    declared_range: Option<(u64, u64)>,
+    first_version: Option<u64>,
+    last_version: Option<u64>,
+    transaction_count: u64,
+) -> Result<()> {
+    let (Some(actual_first), Some(actual_last)) = (first_version, last_version) else {
+        return Err(HotIndexError::Config(format!(
+            "protobuf raw chunk {} decoded zero transactions",
+            raw_input.display()
+        )));
+    };
+    if let Some((declared_first, declared_last)) = declared_range {
+        if actual_first != declared_first || actual_last != declared_last {
+            return Err(HotIndexError::Config(format!(
+                "protobuf raw chunk {} range mismatch: filename declares {}..{}, decoded {}..{}",
+                raw_input.display(),
+                declared_first,
+                declared_last,
+                actual_first,
+                actual_last
+            )));
+        }
+        let expected_count = declared_last
+            .checked_sub(declared_first)
+            .and_then(|span| span.checked_add(1))
+            .ok_or_else(|| {
+                HotIndexError::Config(format!(
+                    "invalid raw chunk version range in {}",
+                    raw_input.display()
+                ))
+            })?;
+        if transaction_count != expected_count {
+            return Err(HotIndexError::Config(format!(
+                "protobuf raw chunk {} transaction count mismatch: filename range implies {}, decoded {}",
+                raw_input.display(),
+                expected_count,
+                transaction_count
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn resolve_protobuf_raw_inputs(input: &Path) -> Result<Vec<PathBuf>> {
     if input.is_file() {
         return Ok(vec![input.to_path_buf()]);
@@ -2706,9 +3103,14 @@ where
         .map_err(|error| HotIndexError::Storage(error.to_string()))?;
     file.sync_all()?;
     fs::rename(&tmp_path, path)?;
+    sync_parent_dir(path)?;
+    Ok(())
+}
+
+fn sync_parent_dir(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
+            dir.sync_all()?;
         }
     }
     Ok(())
@@ -2776,8 +3178,9 @@ mod tests {
     use super::{
         build_query_corpus, build_query_corpus_command, fixture_command, normalize_command,
         parse_byte_size, read_json, record_command, replay_into_memory, resolve_record_end_version,
-        write_json_pretty, write_synthetic_dataset, DatasetManifest, HotIndexError,
-        NormalizedEvent, SyntheticDataset, NORMALIZED_ARTIFACTS, QUERY_CORPUS_ARTIFACTS,
+        write_json_pretty, write_synthetic_dataset, DatasetManifest, DecibelEventPayload,
+        DecibelEventType, FillRow, HotIndexError, Network, NormalizedEvent, QueryCorpusRecord,
+        QueryCorpusRows, QueryKind, SyntheticDataset, NORMALIZED_ARTIFACTS, QUERY_CORPUS_ARTIFACTS,
     };
     use decibel_hotindex_storage::StorageEngine;
     use std::path::PathBuf;
@@ -2799,6 +3202,30 @@ mod tests {
         let checksums = engine.checksums().unwrap();
         assert!(checksums.iter().any(|checksum| checksum.row_count > 0));
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn rocksdb_replay_rejects_existing_db_path() {
+        let root = temp_root("rocksdb-existing-replay");
+        let _ = std::fs::remove_dir_all(&root);
+        let dataset = SyntheticDataset::generate(4);
+        write_synthetic_dataset(&root, &dataset).unwrap();
+        let db_path = root.join("materialized/rocksdb");
+        std::fs::create_dir_all(&db_path).unwrap();
+
+        let err = super::replay_command(&[
+            "--dataset".to_string(),
+            root.display().to_string(),
+            "--engine".to_string(),
+            "rocksdb".to_string(),
+            "--db-path".to_string(),
+            db_path.display().to_string(),
+        ])
+        .unwrap_err();
+
+        assert!(err.to_string().contains("db path already exists"));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2841,6 +3268,44 @@ mod tests {
             HotIndexError::Config(message) if message.contains("sha256 mismatch")
         ));
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn replay_rejects_manifest_hash_paths_outside_dataset() {
+        let root = temp_root("hash-path-outside");
+        let _ = std::fs::remove_dir_all(&root);
+        let dataset = SyntheticDataset::generate(4);
+        write_synthetic_dataset(&root, &dataset).unwrap();
+
+        let mut manifest = read_json::<DatasetManifest>(&root.join("manifest.json")).unwrap();
+        manifest
+            .hashes
+            .sha256
+            .insert("../outside.ndjson".to_string(), "0".repeat(64));
+        write_json_pretty(&root.join("manifest.json"), &manifest).unwrap();
+
+        let err = replay_into_memory(&root).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("dataset manifest contains invalid artifact path"));
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn replay_rejects_legacy_schema_manifest() {
+        let root = temp_root("legacy-schema");
+        let _ = std::fs::remove_dir_all(&root);
+        let dataset = SyntheticDataset::generate(4);
+        write_synthetic_dataset(&root, &dataset).unwrap();
+
+        let mut manifest = read_json::<DatasetManifest>(&root.join("manifest.json")).unwrap();
+        manifest.schema_version = 1;
+        write_json_pretty(&root.join("manifest.json"), &manifest).unwrap();
+
+        let err = replay_into_memory(&root).unwrap_err();
+        assert!(err.to_string().contains("schema_version 1 is unsupported"));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -2906,11 +3371,51 @@ mod tests {
     #[test]
     fn query_corpus_uses_hit_capable_keys() {
         let dataset = SyntheticDataset::generate(8);
-        let corpus = build_query_corpus(&dataset.events);
+        let corpus = build_query_corpus(&QueryCorpusRows {
+            txs: &dataset.txs,
+            events: &dataset.events,
+            fills: &dataset.fills,
+            builder_rows: &dataset.builder_rows,
+        });
         assert!(corpus.iter().any(|record| record.tx_version.is_some()));
         assert!(corpus.iter().any(|record| record.market_id.is_some()));
         assert!(corpus.iter().any(|record| record.account.is_some()));
         assert!(corpus.iter().any(|record| record.builder_addr.is_some()));
+    }
+
+    #[test]
+    fn query_corpus_does_not_emit_fill_scans_from_event_only_metadata() {
+        let event = NormalizedEvent {
+            network: Network::Mainnet,
+            version: 1,
+            event_idx: 0,
+            tx_hash: "tx1".to_string(),
+            block_timestamp_us: 1,
+            event_type: DecibelEventType::OrderPlaced,
+            market_id: Some("BTC-PERP".to_string()),
+            account: Some("acct-a".to_string()),
+            subaccount: None,
+            order_id: Some("order-1".to_string()),
+            builder_addr: Some("builder-1".to_string()),
+            payload: DecibelEventPayload::Empty,
+        };
+
+        let corpus = build_query_corpus(&QueryCorpusRows {
+            txs: &[],
+            events: &[event],
+            fills: &[],
+            builder_rows: &[],
+        });
+
+        assert!(corpus
+            .iter()
+            .any(|record| record.query_kind == QueryKind::GetTxByVersion));
+        assert!(!corpus
+            .iter()
+            .any(|record| record.query_kind == QueryKind::MarketFillScan));
+        assert!(!corpus
+            .iter()
+            .any(|record| record.query_kind == QueryKind::BuilderCodeFillScan));
     }
 
     #[test]
@@ -2965,6 +3470,24 @@ mod tests {
             .hashes
             .sha256
             .contains_key("raw/transactions_102_103.pb.zst"));
+        assert!(manifest
+            .hashes
+            .sha256
+            .contains_key("queries/point_tx_versions.ndjson"));
+        assert!(manifest
+            .hashes
+            .sha256
+            .contains_key("queries/multi_get_tx_versions.ndjson"));
+
+        let point_queries =
+            super::read_ndjson::<QueryCorpusRecord>(&root.join("queries/point_tx_versions.ndjson"))
+                .unwrap();
+        let multi_get_queries = super::read_ndjson::<QueryCorpusRecord>(
+            &root.join("queries/multi_get_tx_versions.ndjson"),
+        )
+        .unwrap();
+        assert_eq!(point_queries.len(), 4);
+        assert_eq!(multi_get_queries.len(), 1);
 
         let engine = replay_into_memory(&root).unwrap();
         let stats = engine.stats().unwrap();
@@ -2975,14 +3498,33 @@ mod tests {
     }
 
     #[test]
-    fn protobuf_normalize_skips_duplicate_versions() {
-        let root = temp_root("protobuf-duplicate-versions");
+    fn protobuf_normalize_extracts_decibel_events() {
+        let root = temp_root("protobuf-decibel-events");
         let _ = std::fs::remove_dir_all(&root);
         let raw_dir = root.join("raw");
         std::fs::create_dir_all(&raw_dir).unwrap();
-        write_test_transaction_versions(
-            &raw_dir.join("transactions_100_103.pb.zst"),
-            &[100, 101, 102, 100, 103],
+        let event = aptos_protos::transaction::v1::Event {
+            type_str: format!("{}::orderbook::TradeEvent", super::MAINNET_DECIBEL_ADDRESS),
+            data: serde_json::json!({
+                "market_id": "BTC-PERP",
+                "account": "0x1",
+                "order_id": "o1",
+                "fill_id": "f1",
+                "side": "buy",
+                "price": "100",
+                "size": "1",
+                "notional": "100",
+                "builder_addr": "0x2",
+                "builder_fee_bps": 5,
+                "estimated_fee_amount": "0.05"
+            })
+            .to_string(),
+            ..Default::default()
+        };
+        write_test_transaction_events(
+            &raw_dir.join("transactions_100_100.pb.zst"),
+            100,
+            vec![event],
         );
 
         normalize_command(&[
@@ -2993,24 +3535,88 @@ mod tests {
             "--format".to_string(),
             "protobuf-zstd".to_string(),
             "--dataset-id".to_string(),
-            "protobuf_duplicate_versions".to_string(),
+            "protobuf_decibel_events".to_string(),
         ])
         .unwrap();
 
         let manifest = read_json::<DatasetManifest>(&root.join("manifest.json")).unwrap();
-        assert_eq!(manifest.start_version, 100);
-        assert_eq!(manifest.end_version, Some(103));
-        assert_eq!(manifest.raw_transaction_count, 4);
+        assert_eq!(manifest.raw_transaction_count, 1);
+        assert_eq!(manifest.decibel_event_count, 1);
+        assert_eq!(manifest.fill_count, 1);
+        assert_eq!(manifest.builder_code_row_count, 1);
+        assert!(manifest
+            .hashes
+            .sha256
+            .contains_key("queries/mixed_dashboard.ndjson"));
+
+        let fills = super::read_ndjson::<FillRow>(&root.join("normalized/fills.ndjson")).unwrap();
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].fill_id, "f1");
 
         let warnings = std::fs::read_to_string(root.join("normalized/parse_warnings.log")).unwrap();
-        assert!(warnings.contains("decoded_transactions=5"));
-        assert!(warnings.contains("unique_transactions=4"));
-        assert!(warnings.contains("duplicate_transactions_skipped=1"));
+        assert!(warnings.contains("decibel_events=1"));
 
         let engine = replay_into_memory(&root).unwrap();
         let stats = engine.stats().unwrap();
-        assert_eq!(stats.tx_count, 4);
+        assert_eq!(stats.fill_count, 1);
+        assert_eq!(stats.builder_attribution_count, 1);
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn protobuf_normalize_rejects_non_contiguous_chunk_directory() {
+        let root = temp_root("protobuf-raw-gap");
+        let _ = std::fs::remove_dir_all(&root);
+        let raw_dir = root.join("raw");
+        std::fs::create_dir_all(&raw_dir).unwrap();
+        write_test_transaction_chunk(&raw_dir.join("transactions_100_101.pb.zst"), 100..=101);
+        write_test_transaction_chunk(&raw_dir.join("transactions_103_104.pb.zst"), 103..=104);
+
+        let err = normalize_command(&[
+            "--input".to_string(),
+            raw_dir.display().to_string(),
+            "--out-dir".to_string(),
+            root.join("normalized").display().to_string(),
+            "--format".to_string(),
+            "protobuf-zstd".to_string(),
+            "--dataset-id".to_string(),
+            "protobuf_raw_gap".to_string(),
+        ])
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("non-contiguous protobuf raw chunks"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn protobuf_normalize_rejects_duplicate_versions() {
+        let root = temp_root("protobuf-duplicate-versions");
+        let _ = std::fs::remove_dir_all(&root);
+        let raw_dir = root.join("raw");
+        std::fs::create_dir_all(&raw_dir).unwrap();
+        write_test_transaction_versions(
+            &raw_dir.join("transactions_100_103.pb.zst"),
+            &[100, 101, 102, 100, 103],
+        );
+
+        let err = normalize_command(&[
+            "--input".to_string(),
+            raw_dir.display().to_string(),
+            "--out-dir".to_string(),
+            root.join("normalized").display().to_string(),
+            "--format".to_string(),
+            "protobuf-zstd".to_string(),
+            "--dataset-id".to_string(),
+            "protobuf_duplicate_versions".to_string(),
+        ])
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("non-contiguous transaction version"));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -3251,10 +3857,32 @@ mod tests {
     fn write_test_transaction_versions(path: &std::path::Path, versions: &[u64]) {
         let mut writer = super::TransactionChunkWriter::create(path).unwrap();
         for version in versions.iter().copied() {
-            let mut transaction = aptos_protos::transaction::v1::Transaction::default();
-            transaction.version = version;
+            let transaction = aptos_protos::transaction::v1::Transaction {
+                version,
+                ..Default::default()
+            };
             writer.write_transaction(&transaction).unwrap();
         }
+        writer.finish().unwrap();
+    }
+
+    fn write_test_transaction_events(
+        path: &std::path::Path,
+        version: u64,
+        events: Vec<aptos_protos::transaction::v1::Event>,
+    ) {
+        let mut writer = super::TransactionChunkWriter::create(path).unwrap();
+        let transaction = aptos_protos::transaction::v1::Transaction {
+            version,
+            txn_data: Some(aptos_protos::transaction::v1::transaction::TxnData::User(
+                aptos_protos::transaction::v1::UserTransaction {
+                    events,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        writer.write_transaction(&transaction).unwrap();
         writer.finish().unwrap();
     }
 }

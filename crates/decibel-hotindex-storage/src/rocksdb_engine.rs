@@ -1,5 +1,9 @@
-use crate::engine::StorageEngine;
 use crate::key;
+use crate::{
+    engine::StorageEngine, CF_BUILDER_CODE_FILLS, CF_FILLS_BY_ACCOUNT_TIME,
+    CF_FILLS_BY_MARKET_TIME, CF_INGEST_CHECKPOINT, CF_MARKET_RECENT_ACTIVITY, CF_ORDER_BY_ID,
+    CF_POSITIONS_BY_ACCOUNT_MARKET, CF_RAW_EVENT_BY_VERSION_IDX, CF_TX_BY_VERSION, LOGICAL_CFS,
+};
 use decibel_hotindex_core::{
     ActivityRow, BuilderAttributionRow, BuilderVolumeRow, CfChecksum, FillRow, HotIndexError,
     IngestCheckpoint, NormalizedEvent, OrderRow, PositionRow, Result, StorageStats, TimeWindow,
@@ -11,28 +15,6 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::Path;
-
-const CF_TX_BY_VERSION: &str = "cf_tx_by_version";
-const CF_RAW_EVENT_BY_VERSION_IDX: &str = "cf_raw_event_by_version_idx";
-const CF_FILLS_BY_MARKET_TIME: &str = "cf_fills_by_market_time";
-const CF_FILLS_BY_ACCOUNT_TIME: &str = "cf_fills_by_account_time";
-const CF_ORDER_BY_ID: &str = "cf_order_by_id";
-const CF_POSITIONS_BY_ACCOUNT_MARKET: &str = "cf_positions_by_account_market";
-const CF_BUILDER_CODE_FILLS: &str = "cf_builder_code_fills";
-const CF_MARKET_RECENT_ACTIVITY: &str = "cf_market_recent_activity";
-const CF_INGEST_CHECKPOINT: &str = "cf_ingest_checkpoint";
-
-const LOGICAL_CFS: &[&str] = &[
-    CF_TX_BY_VERSION,
-    CF_RAW_EVENT_BY_VERSION_IDX,
-    CF_FILLS_BY_MARKET_TIME,
-    CF_FILLS_BY_ACCOUNT_TIME,
-    CF_ORDER_BY_ID,
-    CF_POSITIONS_BY_ACCOUNT_MARKET,
-    CF_BUILDER_CODE_FILLS,
-    CF_MARKET_RECENT_ACTIVITY,
-    CF_INGEST_CHECKPOINT,
-];
 
 #[derive(Debug)]
 pub struct RocksDbEngine {
@@ -62,6 +44,21 @@ impl RocksDbEngine {
 
         let db = DB::open_cf_descriptors(&db_opts, path, descriptors).map_err(rocks_error)?;
         Ok(Self { db })
+    }
+
+    pub fn compact_all(&self) -> Result<()> {
+        for cf_name in LOGICAL_CFS {
+            let cf = self.cf(cf_name)?;
+            self.db.compact_range_cf(cf, None::<&[u8]>, None::<&[u8]>);
+        }
+        Ok(())
+    }
+
+    pub fn flush_all(&self) -> Result<()> {
+        for cf_name in LOGICAL_CFS {
+            self.db.flush_cf(self.cf(cf_name)?).map_err(rocks_error)?;
+        }
+        Ok(())
     }
 
     fn cf(&self, name: &str) -> Result<&rocksdb::ColumnFamily> {
@@ -193,7 +190,11 @@ impl StorageEngine for RocksDbEngine {
     fn put_position(&self, position: PositionRow) -> Result<()> {
         self.put_json(
             CF_POSITIONS_BY_ACCOUNT_MARKET,
-            key::positions_by_account_market(&position.account, &position.market_id),
+            key::positions_by_account_market(
+                &position.account,
+                &position.market_id,
+                position.subaccount.as_deref(),
+            ),
             &position,
         )
     }

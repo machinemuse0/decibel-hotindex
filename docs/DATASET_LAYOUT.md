@@ -142,6 +142,7 @@ Required fields:
 ```json
 {
   "dataset_id": "mainnet_decibel_v4365621793_v4369000000_2026-05-27",
+  "schema_version": 2,
   "network": "mainnet",
   "source": "aptos_transaction_stream",
   "transaction_stream_endpoint": "https://grpc.mainnet.aptoslabs.com:443",
@@ -186,8 +187,8 @@ rtk cargo run -p decibel-dataset -- record --network mainnet --endpoint https://
 
 - `point_tx_versions` must be sampled from real transaction versions in the dataset.
 - `multi_get_tx_versions` must batch real transaction versions in the dataset.
-- `market_fill_scans` must use market IDs present in fills/activity rows.
-- `account_fill_scans` must use accounts present in rows.
+- `market_fill_scans` must use market IDs present in `fills.ndjson`.
+- `account_fill_scans` must use accounts present in `fills.ndjson`.
 - `builder_code_scans` must use builder addresses present in attribution rows.
 - `builder_code_volumes` must use builder addresses present in attribution rows.
 - `mixed_dashboard` must combine hit-capable primitive query records according to the configured workload mix. It is a workload file, not a requirement that records use `query_kind=mixed_dashboard`.
@@ -198,7 +199,22 @@ Random non-hit keys are allowed only in explicit negative-query workloads and mu
 
 - Every benchmark report references `dataset_id`, not just a local path.
 - Manifest sha256 must cover raw, normalized, and query corpus files.
+- Benchmark runners reject open `end_version`, zero `raw_transaction_count`,
+  invalid manifest artifact paths, sha256 mismatches, missing normalized
+  artifact hashes, and serving query corpus files that are absent from the
+  manifest hash map.
 - Recording supports resume from `last_success_version` once real gRPC support exists.
 - RocksDB and ToplingDB benchmark databases must be materialized from the same raw/normalized dataset.
+- Disk backend replay writes to a sibling hidden staging directory and promotes
+  it to `materialized/<backend>` only after replay succeeds.
+- Storage logical column-family names are defined once in
+  `decibel-hotindex-storage::LOGICAL_CFS`; backend checksum output must follow
+  that list exactly.
+- Backend checksums use SHA-256 over length-prefixed logical key bytes and value
+  bytes. MemoryEngine serializes typed rows with the same JSON encoding used by
+  RocksDB values; RocksDB hashes iterator-returned raw value bytes. Debug-format
+  hashes and partial CF lists are not valid schema-equivalence evidence.
+- Text key segments are separator-delimited and must not contain `0x00`; storage
+  key builders reject such segments in release builds.
 - The raw archive is immutable. If normalization logic changes, produce a new normalized artifact and update manifest/parser metadata instead of overwriting raw files.
 - Synthetic amplification must never be presented as real mainnet data.

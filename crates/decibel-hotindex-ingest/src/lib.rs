@@ -3,7 +3,8 @@
 pub mod decibel_parser;
 
 pub use decibel_parser::{
-    parse_fixture_jsonl_file, parse_fixture_jsonl_str, ParserOptions, ParserOutput,
+    parse_decibel_event_from_parts, parse_fixture_jsonl_file, parse_fixture_jsonl_str,
+    DecibelEventInput, ParserOptions, ParserOutput,
 };
 
 pub fn crate_status() -> &'static str {

@@ -9,8 +9,8 @@ Current status:
   - range: `4365621793..4365622792`
   - decoded transactions: `1000`
   - remaining bytes after decode: `0`
-- Real Aptos protobuf tx-only `normalize` is wired. It materializes transaction rows for RocksDB/ToplingDB replay and point/multi-get benchmarks.
-- Decibel event extraction from real protobuf transactions is still pending, so fills/orders/positions/builder rows remain empty for real tx-only imports.
+- Real Aptos protobuf `normalize` is wired. It materializes transaction rows and extracts Decibel events when the bounded range contains matching event types.
+- Ranges with no Decibel events remain useful for tx point/multi-get smoke benchmarks, but Decibel serving workloads require a Decibel-active range.
 
 ## 1. Server Prerequisites
 
@@ -239,11 +239,13 @@ Notes:
 
 - `tx_versions_*.u64be` contains every recorded transaction version as big-endian `u64`; for 15.75M tx it is about 126 MiB.
 - query corpus files are sampled during record using `--key-sample-limit`.
-- Decibel market/account/builder query files still require protobuf normalization and event parsing.
+- Decibel market/account query files are generated from `fills.ndjson`; builder
+  query files are generated from `builder_code_rows.ndjson`. Event metadata
+  alone is not enough for a hit-capable serving workload.
 
 ## 6. RocksDB Baseline
 
-RocksDB is already wired. For fixture/synthetic and real tx-only datasets:
+RocksDB is already wired. For fixture/synthetic and real protobuf datasets:
 
 ```bash
 rtk cargo check -p decibel-hotindex-storage --features rocksdb
@@ -257,7 +259,7 @@ rtk cargo build -p decibel-dataset -p decibel-admin --features rocksdb --release
 rtk ./scripts/import-real-data.sh rocksdb "$DATASET_ROOT" --bin-dir target/rocksdb/release
 ```
 
-The script normalizes `$DATASET_ROOT/raw/transactions_*.pb.zst` into tx-only normalized artifacts, replays them into `$DATASET_ROOT/materialized/rocksdb`, and writes `$DATASET_ROOT/reports/rocksdb-checksums.json`.
+The script normalizes `$DATASET_ROOT/raw/transactions_*.pb.zst`, replays the normalized artifacts into `$DATASET_ROOT/materialized/rocksdb`, and writes `$DATASET_ROOT/reports/rocksdb-checksums.json`.
 
 Manual equivalent:
 
@@ -304,7 +306,7 @@ rtk ./scripts/import-real-data.sh rocksdb "$DATASET_ROOT" --bin-dir target/rocks
 cd /Users/ssyuan/work/project/decibel-hotindex-topingdb
 export TOPLINGDB_EASY_MIGRATE_CONF=/path/to/sui/crates/typed-store/config/topling_sui.yaml
 rtk ./scripts/check-backend-isolation.sh toplingdb
-rtk cargo build -p decibel-dataset -p decibel-admin --features toplingsdb --release --target-dir target/topingdb
+rtk ./scripts/toplingdb-cargo.sh build -p decibel-dataset -p decibel-admin --features toplingsdb --release --target-dir target/topingdb
 rtk ./scripts/import-real-data.sh toplingdb "$DATASET_ROOT" \
   --bin-dir target/topingdb/release \
   --toplingdb-conf "$TOPLINGDB_EASY_MIGRATE_CONF"
@@ -313,6 +315,26 @@ rtk ./scripts/import-real-data.sh toplingdb "$DATASET_ROOT" \
 If the server does not have a Sui checkout with `topling_sui.yaml`, copy that
 config from the Sui/ToplingDB environment used by `sui-hotstore`. Do not invent a
 config silently; record the exact config path and sha256 in benchmark notes.
+
+On macOS runners or developer machines, ToplingDB feature builds must go through
+`scripts/toplingdb-cargo.sh` in the `topingdb` worktree. The wrapper supplies
+Darwin compatibility for the pinned `rust-toplingdb` revision and applies a
+narrow, idempotent patch to the Cargo git checkout. Linux benchmark servers
+should still use the same wrapper so the command shape remains identical across
+environments.
+
+ToplingDB native builds are intentionally separate from the fast RocksDB path.
+The upstream build compiles a large C++ dependency with LTO, so use a cached
+target directory and treat this as a benchmark preflight, not a per-push smoke.
+Run the full preflight from the `topingdb` worktree before building benchmark
+artifacts. `--skip-release-build` is useful for a quick feature check, but it is
+not enough for publishable ToplingDB numbers. For grant or README packages,
+write the full preflight marker consumed by the package gate:
+
+```bash
+rtk ./scripts/toplingdb-preflight.sh \
+  --write-ok "$DATASET_ROOT/reports/toplingdb-preflight.ok"
+```
 
 Compare checksums only after both isolated imports complete:
 
@@ -342,7 +364,8 @@ ToplingDB serving benchmark from `topingdb`:
 ```bash
 cd /Users/ssyuan/work/project/decibel-hotindex-topingdb
 export TOPLINGDB_EASY_MIGRATE_CONF=/path/to/sui/crates/typed-store/config/topling_sui.yaml
-rtk cargo build -p decibel-hotindex-bench --features toplingsdb --release --target-dir target/topingdb
+rtk ./scripts/toplingdb-preflight.sh --write-ok "$DATASET_ROOT/reports/toplingdb-preflight.ok"
+rtk ./scripts/toplingdb-cargo.sh build -p decibel-hotindex-bench --features toplingsdb --release --target-dir target/topingdb
 rtk ./scripts/run-benchmark-suite.sh \
   --backend toplingdb \
   --dataset "$DATASET_ROOT" \
@@ -362,11 +385,11 @@ rtk cargo run -p decibel-hotindex-bench -- summarize \
   --out "$DATASET_ROOT/reports/BENCHMARK_SUMMARY.md"
 ```
 
-## 9. Current Blocking Item
+## 9. Current Limitation
 
-The live raw archive path and tx-only RocksDB/ToplingDB materialization are ready. The remaining blocker before full Decibel workload benchmarks is:
+The live raw archive path and RocksDB/ToplingDB materialization are ready. Full Decibel workload benchmarks still require:
 
-- extract Decibel events from real `Transaction` messages
-- generate market/account/builder query corpora from normalized real Decibel rows
+- a bounded range that actually contains Decibel events
+- checksum-passed materialization in both backend worktrees
 
-Until then, server work can collect raw archives, import tx rows into both backends, run checksum comparison, and use tx point/multi-get query files for smoke benchmarks.
+Ranges with no Decibel events can still validate raw recording, protobuf decoding, tx replay, checksum comparison, and tx point/multi-get smoke benchmarks.

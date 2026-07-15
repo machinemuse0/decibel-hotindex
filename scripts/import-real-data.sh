@@ -11,8 +11,8 @@ Options:
                          Default: DECIBEL_BIN_DIR, then target/release, then target/debug.
   --raw-input <path>     Raw .pb.zst chunk or raw directory. Default: <dataset-root>/raw
   --skip-normalize       Reuse existing <dataset-root>/normalized and manifest.json
-  --force-normalize      Rebuild normalized tx-only artifacts even if they already exist
-  --force                Remove existing materialized RocksDB path before replay
+  --force-normalize      Rebuild normalized artifacts even if they already exist
+  --force                Replace existing materialized RocksDB path after staging succeeds
   --network <name>       Dataset network metadata. Default: mainnet
   --dataset-id <id>      Dataset id metadata. Default: dataset root basename
   --parser-commit <sha>  Parser commit metadata
@@ -116,6 +116,48 @@ network="mainnet"
 dataset_id=""
 parser_commit=""
 config_path=""
+active_staging_db_path=""
+active_staging_checksum_path=""
+active_backup_db_path=""
+active_backup_checksum_path=""
+active_final_db_path=""
+active_final_checksum_path=""
+active_final_db_owned=0
+active_final_checksum_owned=0
+active_promotion_complete=1
+
+cleanup_staging() {
+  if [[ "$active_promotion_complete" -eq 0 ]]; then
+    if [[ "$active_final_db_owned" -eq 1 && -n "$active_final_db_path" ]]; then
+      rm -rf "$active_final_db_path"
+    fi
+    if [[ "$active_final_checksum_owned" -eq 1 && -n "$active_final_checksum_path" ]]; then
+      rm -f "$active_final_checksum_path"
+    fi
+    if [[ -n "$active_backup_db_path" && -e "$active_backup_db_path" ]]; then
+      rm -rf "$active_final_db_path"
+      mv "$active_backup_db_path" "$active_final_db_path"
+    fi
+    if [[ -n "$active_backup_checksum_path" && -e "$active_backup_checksum_path" ]]; then
+      rm -f "$active_final_checksum_path"
+      mv "$active_backup_checksum_path" "$active_final_checksum_path"
+    fi
+  else
+    if [[ -n "$active_backup_db_path" ]]; then
+      rm -rf "$active_backup_db_path"
+    fi
+    if [[ -n "$active_backup_checksum_path" ]]; then
+      rm -f "$active_backup_checksum_path"
+    fi
+  fi
+  if [[ -n "$active_staging_db_path" ]]; then
+    rm -rf "$active_staging_db_path"
+  fi
+  if [[ -n "$active_staging_checksum_path" ]]; then
+    rm -f "$active_staging_checksum_path"
+  fi
+}
+trap cleanup_staging EXIT
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -212,26 +254,69 @@ normalize_dataset() {
 import_rocksdb() {
   local db_path="$dataset_root/materialized/rocksdb"
   local checksum_path="$dataset_root/reports/rocksdb-checksums.json"
+  local staging_db_path="$dataset_root/materialized/.rocksdb.staging.$$"
+  local staging_checksum_path="$dataset_root/reports/.rocksdb-checksums.json.staging.$$"
+  local backup_db_path="$dataset_root/materialized/.rocksdb.backup.$$"
+  local backup_checksum_path="$dataset_root/reports/.rocksdb-checksums.json.backup.$$"
+  active_staging_db_path="$staging_db_path"
+  active_staging_checksum_path="$staging_checksum_path"
+  active_final_db_path="$db_path"
+  active_final_checksum_path="$checksum_path"
+  active_final_db_owned=0
+  active_final_checksum_owned=0
+  active_promotion_complete=1
 
   if [[ -e "$db_path" ]]; then
-    if [[ "$force" -eq 1 ]]; then
-      rm -rf "$db_path"
-    else
+    if [[ "$force" -ne 1 ]]; then
       die "materialized DB path already exists: $db_path (pass --force to rebuild)"
     fi
   fi
 
   mkdir -p "$dataset_root/materialized" "$dataset_root/reports"
+  rm -rf "$staging_db_path"
+  rm -f "$staging_checksum_path"
+  rm -rf "$backup_db_path"
+  rm -f "$backup_checksum_path"
 
   run_cmd "$dataset_bin" replay \
     --dataset "$dataset_root" \
     --engine rocksdb \
-    --db-path "$db_path"
+    --db-path "$staging_db_path"
 
   run_cmd "$admin_bin" checksum \
     --engine rocksdb \
-    --db-path "$db_path" \
-    --out "$checksum_path"
+    --db-path "$staging_db_path" \
+    --out "$staging_checksum_path"
+
+  active_promotion_complete=0
+  if [[ -e "$db_path" ]]; then
+    mv "$db_path" "$backup_db_path"
+    active_backup_db_path="$backup_db_path"
+  fi
+  if [[ -e "$checksum_path" ]]; then
+    mv "$checksum_path" "$backup_checksum_path"
+    active_backup_checksum_path="$backup_checksum_path"
+  fi
+
+  mv "$staging_db_path" "$db_path"
+  active_staging_db_path=""
+  active_final_db_owned=1
+  mv "$staging_checksum_path" "$checksum_path"
+  active_staging_checksum_path=""
+  active_final_checksum_owned=1
+  active_promotion_complete=1
+  if [[ -n "$active_backup_db_path" ]]; then
+    rm -rf "$active_backup_db_path"
+    active_backup_db_path=""
+  fi
+  if [[ -n "$active_backup_checksum_path" ]]; then
+    rm -f "$active_backup_checksum_path"
+    active_backup_checksum_path=""
+  fi
+  active_final_db_owned=0
+  active_final_checksum_owned=0
+  active_final_db_path=""
+  active_final_checksum_path=""
 }
 
 normalize_dataset

@@ -91,7 +91,7 @@ rtk cargo check --workspace
 rtk cargo test --workspace
 rtk cargo check -p decibel-hotindex-storage --features rocksdb
 rtk cargo test -p decibel-hotindex-storage --features rocksdb
-rtk cargo check -p decibel-hotindex-storage --features toplingsdb
+rtk ./scripts/toplingdb-cargo.sh check -p decibel-hotindex-storage --features toplingsdb
 rtk cargo run -p decibel-dataset --features rocksdb -- replay --dataset /private/tmp/decibel-hotindex-m4-smoke --engine rocksdb --db-path /private/tmp/decibel-hotindex-m4-smoke/materialized/rocksdb
 rtk cargo run -p decibel-admin --features rocksdb -- checksum --engine rocksdb --db-path /private/tmp/decibel-hotindex-m4-smoke/materialized/rocksdb --out /private/tmp/decibel-hotindex-m4-smoke/reports/rocksdb-checksums.json
 rtk cargo run -p decibel-admin -- compare-checksum --left /private/tmp/decibel-hotindex-m4-smoke/reports/rocksdb-checksums.json --right /private/tmp/decibel-hotindex-m4-smoke/reports/rocksdb-checksums.json

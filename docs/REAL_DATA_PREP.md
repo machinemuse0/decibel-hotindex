@@ -71,7 +71,7 @@ Current `decibel-dataset record` is safe by default and only opens the live stre
 - uses Aptos `aptos-protos` generated client from the official `aptos-core` repository
 - writes length-delimited `Transaction` protobuf messages into `.pb.zst` chunks
 - supports `--resume`, `--transactions-count`, `--max-raw-bytes`, and bounded transaction chunks
-- supports tx-only protobuf normalization from a single chunk or a raw directory
+- supports protobuf normalization from a single chunk or a raw directory, including Decibel events when they are present in the selected range
 - supports RocksDB import in `main` and ToplingDB import in the dedicated `topingdb` worktree
 
 Next implementation steps:
@@ -153,7 +153,7 @@ Import ToplingDB from the separate `topingdb` worktree:
 cd /Users/ssyuan/work/project/decibel-hotindex-topingdb
 export TOPLINGDB_EASY_MIGRATE_CONF=/path/to/topling_sui.yaml
 rtk ./scripts/check-backend-isolation.sh toplingdb
-rtk cargo build -p decibel-dataset -p decibel-admin --features toplingsdb --release --target-dir target/topingdb
+rtk ./scripts/toplingdb-cargo.sh build -p decibel-dataset -p decibel-admin --features toplingsdb --release --target-dir target/topingdb
 rtk ./scripts/import-real-data.sh toplingdb <dataset> \
   --bin-dir target/topingdb/release \
   --toplingdb-conf "$TOPLINGDB_EASY_MIGRATE_CONF"
@@ -169,4 +169,4 @@ rtk cargo run -p decibel-admin -- compare-checksum \
 
 The import scripts intentionally have no `both` mode. Keep RocksDB and ToplingDB imports separate so `TOPLINGDB_EASY_MIGRATE_CONF` and patched `rocksdb` crates cannot leak across backend runs.
 
-This is currently tx-only for real protobuf data: transaction rows are imported, while Decibel fills/orders/positions/builder rows stay empty until event extraction lands.
+For real protobuf data, transaction rows are always imported. Decibel fills/orders/positions/builder rows are populated when the selected bounded range contains matching Decibel events.

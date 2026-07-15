@@ -1,6 +1,13 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub const LOGICAL_SCHEMA_VERSION: u32 = 2;
+pub const LEGACY_LOGICAL_SCHEMA_VERSION: u32 = 1;
+
+fn legacy_logical_schema_version() -> u32 {
+    LEGACY_LOGICAL_SCHEMA_VERSION
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Network {
@@ -57,6 +64,8 @@ pub struct DatasetFileHashes {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatasetManifest {
     pub dataset_id: DatasetId,
+    #[serde(default = "legacy_logical_schema_version")]
+    pub schema_version: u32,
     pub network: Network,
     pub source: String,
     pub transaction_stream_endpoint: Option<String>,

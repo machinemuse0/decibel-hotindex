@@ -1,6 +1,6 @@
 # Benchmark Methodology
 
-Last updated: 2026-05-27
+Last updated: 2026-06-30
 
 This document defines the minimum methodology required before Decibel HotIndex benchmark results can be used in README, grant material, outreach, or comparison claims.
 
@@ -14,6 +14,11 @@ Serving benchmarks are offline. They consume:
 - a selected storage backend
 
 They must not record Aptos data, call Aptos gRPC, normalize raw transactions, or generate random non-hit keys during the measured benchmark.
+
+Before measuring any backend, the benchmark runner validates `manifest.json`.
+It rejects open-ended ranges, zero-transaction datasets, sha256 mismatches,
+missing normalized artifact hashes, and serving query corpus files that are not
+recorded in the manifest hash map.
 
 ## Benchmark Classes
 
@@ -66,6 +71,10 @@ Reports:
 All measured queries must come from corpus files produced by `decibel-dataset build-query-corpus`.
 
 The corpus must be derived from normalized dataset rows so query keys are hit-capable. Synthetic negative-key workloads are allowed only when separately named and reported.
+Fill scan keys must come from `fills.ndjson`, builder-code keys must come from
+`builder_code_rows.ndjson`, and transaction point/multi-get keys must come from
+`txs.ndjson` or recorded transaction key files. Do not derive scan keys from
+optional `events.ndjson` metadata unless the target table row also exists.
 
 Default mixed workload:
 
@@ -86,6 +95,9 @@ Default mixed workload:
 - Key cloning, request construction, JSON parsing, and corpus loading must happen before measured timing starts.
 - Multi-get should use backend-native batched APIs where available.
 - Requests per worker must have a sane lower bound to avoid tiny-sample throughput artifacts.
+- Serving and read-under-ingest query benchmarks support `--concurrency`; each
+  worker records a local HDR histogram and the runner merges worker histograms in
+  the final report.
 
 ## Access Patterns
 
@@ -95,12 +107,15 @@ Benchmark config must record:
 - `uniform`
 - `zipfian`
 - seed
+- query worker concurrency
 
 Dashboard-style mixed workloads should default to zipfian unless the report explicitly says otherwise.
 
 ## Latency Measurement
 
-Use HDR histogram or an equivalent mergeable histogram.
+Use HDR histogram or an equivalent mergeable histogram. The current runner uses
+`hdrhistogram` and writes `latency_us.method = hdr_histogram` into each JSON
+report.
 
 Required percentiles:
 
@@ -109,7 +124,9 @@ Required percentiles:
 - p99
 - p999
 
-Closed-loop mode measures max throughput behavior. Open-loop `--rate` mode is required for latency-sensitive reports and should measure latency against scheduled start time to reduce coordinated omission.
+Closed-loop mode measures max throughput behavior. Open-loop `--rate` mode is
+required for latency-sensitive reports and measures latency against scheduled
+start time to reduce coordinated omission.
 
 ## Environment Fingerprint
 
@@ -129,11 +146,29 @@ Reports must include:
 - storage path
 - compaction/cache state
 
+The current runner writes these under `environment` and `storage`. Environment
+capture is best-effort across macOS and Linux; missing fields must be treated as
+`unknown`, not inferred.
+
+The runner also writes a `gate` block. `gate.status=pass` means the report met
+the hard evidence checks. `gate.status=bypassed` is produced only when
+`--allow-failures` was used and is diagnostic evidence, not publishable
+benchmark evidence.
+
+Reports are engineering smoke by default. Use `--publishable-candidate` only
+after the dataset, backend checksum, release binary, compaction/cache state, and
+environment evidence are ready for package review. This flag cannot be combined
+with `--allow-failures`, and the runner gate rejects debug binaries.
+
 ## Compaction and Cache State
 
 Benchmark reports must say whether the database was compacted before the run.
+For RocksDB, pass `--compact-before-run` to compact all logical column families
+before measured operations. Memory reports mark compaction as `not_applicable`.
 
-Cold-cache claims are allowed only if page cache was actually cleared and the command/permission is documented. Otherwise report as warm-cache or unspecified-cache.
+Cold-cache claims are allowed only if page cache was actually cleared and the
+command/permission is documented with `--cache-state cold-cleared` and
+`--cache-clear-command <command>`. Otherwise report as `warm` or `unspecified`.
 
 ## Error Reporting
 
@@ -160,8 +195,10 @@ Every benchmark summary starts with:
 - version range
 - backend
 - workload
+- concurrency
 - query corpus id/hash
 - checksum status
+- gate status
 - environment fingerprint summary
+- methodology status
 - disclaimer: same schema, same dataset, same keyset, same workload
-

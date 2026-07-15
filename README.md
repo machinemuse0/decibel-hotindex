@@ -23,11 +23,11 @@ Milestone 4 is in progress:
 - ToplingDB integration isolated on the `topingdb` branch/worktree
 - admin checksum / compare-checksum commands
 - mainnet raw archive recording: length-delimited Aptos Transaction protobuf + zstd
-- mainnet protobuf normalization: tx rows only; Decibel event extraction is pending
+- mainnet protobuf normalization: transaction rows plus Decibel events when the bounded range contains matching event types
 - RocksDB replay from the same saved dataset
 - ToplingDB native binding is patched only in the `topingdb` worktree; do not publish RocksDB vs ToplingDB numbers without checksum equivalence
 - REST API: not started (M6)
-- benchmark runner: offline smoke/CI only until methodology hardening lands
+- benchmark runner: offline gated reports with explicit `--publishable-candidate`; external claims still require the grant package gate
 
 ## Workspace
 
@@ -71,6 +71,16 @@ rtk cargo run -p decibel-dataset -- replay --dataset /private/tmp/decibel-hotind
 
 Mainnet raw data should be pulled as few times as possible, ideally once per bounded dataset. RocksDB and ToplingDB benchmarks must replay from the same saved raw/normalized dataset, but from separate backend worktrees. Benchmark code must not call Aptos gRPC.
 
+## Benchmark Reproduction
+
+Publishable benchmark reproduction is always three steps:
+
+1. Record or receive a bounded dataset with `manifest.json`, raw chunk sha256s, and deterministic query corpora.
+2. Replay the same dataset into RocksDB from `main` and ToplingDB from the isolated `topingdb` worktree, then run `decibel-admin compare-checksum`.
+3. Run benchmark reports against the materialized backend paths and publish numbers only with dataset id, query corpus hash, checksum status, and environment fingerprint.
+
+See [Grant Package Checklist](docs/GRANT_PACKAGE_CHECKLIST.md) before using any benchmark number in README, grant material, or outreach.
+
 ## Non-Goals
 
 - No matching engine.
@@ -92,4 +102,6 @@ Builder-code metrics are analytics estimates from parsed Decibel events, not off
 - [Benchmark Methodology](docs/BENCHMARK_METHODOLOGY.md)
 - [Backend Worktrees](docs/BACKEND_WORKTREES.md)
 - [Local RocksDB End-to-End Flow](docs/LOCAL_ROCKSDB_FLOW.md)
+- [Grant Package Checklist](docs/GRANT_PACKAGE_CHECKLIST.md)
+- [Outreach Message](docs/OUTREACH_MESSAGE.md)
 - [Spikes](docs/SPIKES.md)

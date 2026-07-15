@@ -1,5 +1,10 @@
 use crate::engine::StorageEngine;
 use crate::key;
+use crate::{
+    CF_BUILDER_CODE_FILLS, CF_FILLS_BY_ACCOUNT_TIME, CF_FILLS_BY_MARKET_TIME, CF_INGEST_CHECKPOINT,
+    CF_MARKET_RECENT_ACTIVITY, CF_ORDER_BY_ID, CF_POSITIONS_BY_ACCOUNT_MARKET,
+    CF_RAW_EVENT_BY_VERSION_IDX, CF_TX_BY_VERSION,
+};
 use decibel_hotindex_core::{
     ActivityRow, BuilderAttributionRow, BuilderVolumeRow, CfChecksum, FillRow, HotIndexError,
     IngestCheckpoint, NormalizedEvent, OrderRow, PositionRow, Result, StorageStats, TimeWindow,
@@ -21,7 +26,7 @@ struct Inner {
     events_by_version_idx: BTreeMap<(u64, u32), NormalizedEvent>,
     fills_by_id: BTreeMap<String, FillRow>,
     orders_by_id: BTreeMap<String, OrderRow>,
-    positions_by_account_market: BTreeMap<(String, String), PositionRow>,
+    positions_by_account_market: BTreeMap<(String, String, Option<String>), PositionRow>,
     builder_attributions_by_fill: BTreeMap<(String, String), BuilderAttributionRow>,
     checkpoints: BTreeMap<String, IngestCheckpoint>,
     activities: Vec<ActivityRow>,
@@ -64,7 +69,11 @@ impl StorageEngine for MemoryEngine {
 
     fn put_position(&self, position: PositionRow) -> Result<()> {
         self.write()?.positions_by_account_market.insert(
-            (position.account.clone(), position.market_id.clone()),
+            (
+                position.account.clone(),
+                position.market_id.clone(),
+                position.subaccount.clone(),
+            ),
             position,
         );
         Ok(())
@@ -267,14 +276,14 @@ impl StorageEngine for MemoryEngine {
         let inner = self.read()?;
         let checksums = vec![
             checksum_cf(
-                "cf_tx_by_version",
+                CF_TX_BY_VERSION,
                 inner
                     .tx_by_version
                     .iter()
                     .map(|(version, row)| checksum_pair(key::tx_by_version(*version), row)),
             )?,
             checksum_cf(
-                "cf_raw_event_by_version_idx",
+                CF_RAW_EVENT_BY_VERSION_IDX,
                 inner
                     .events_by_version_idx
                     .iter()
@@ -283,7 +292,7 @@ impl StorageEngine for MemoryEngine {
                     }),
             )?,
             checksum_cf(
-                "cf_fills_by_market_time",
+                CF_FILLS_BY_MARKET_TIME,
                 inner.fills_by_id.values().map(|row| {
                     checksum_pair(
                         key::fills_by_market_time(
@@ -297,7 +306,7 @@ impl StorageEngine for MemoryEngine {
                 }),
             )?,
             checksum_cf(
-                "cf_fills_by_account_time",
+                CF_FILLS_BY_ACCOUNT_TIME,
                 inner.fills_by_id.values().map(|row| {
                     checksum_pair(
                         key::fills_by_account_time(
@@ -311,23 +320,29 @@ impl StorageEngine for MemoryEngine {
                 }),
             )?,
             checksum_cf(
-                "cf_order_by_id",
+                CF_ORDER_BY_ID,
                 inner
                     .orders_by_id
                     .iter()
                     .map(|(order_id, row)| checksum_pair(key::order_by_id(order_id), row)),
             )?,
             checksum_cf(
-                "cf_positions_by_account_market",
-                inner
-                    .positions_by_account_market
-                    .iter()
-                    .map(|((account, market_id), row)| {
-                        checksum_pair(key::positions_by_account_market(account, market_id), row)
-                    }),
+                CF_POSITIONS_BY_ACCOUNT_MARKET,
+                inner.positions_by_account_market.iter().map(
+                    |((account, market_id, subaccount), row)| {
+                        checksum_pair(
+                            key::positions_by_account_market(
+                                account,
+                                market_id,
+                                subaccount.as_deref(),
+                            ),
+                            row,
+                        )
+                    },
+                ),
             )?,
             checksum_cf(
-                "cf_builder_code_fills",
+                CF_BUILDER_CODE_FILLS,
                 inner.builder_attributions_by_fill.values().map(|row| {
                     checksum_pair(
                         key::builder_code_fills(
@@ -341,7 +356,7 @@ impl StorageEngine for MemoryEngine {
                 }),
             )?,
             checksum_cf(
-                "cf_market_recent_activity",
+                CF_MARKET_RECENT_ACTIVITY,
                 inner.activities.iter().map(|row| {
                     checksum_pair(
                         key::market_activity(
@@ -356,7 +371,7 @@ impl StorageEngine for MemoryEngine {
                 }),
             )?,
             checksum_cf(
-                "cf_ingest_checkpoint",
+                CF_INGEST_CHECKPOINT,
                 inner.checkpoints.values().map(|row| {
                     checksum_pair(
                         key::ingest_checkpoint(row.network, &row.package_address),

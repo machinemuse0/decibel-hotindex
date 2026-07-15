@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Fetch locked dependencies
+        run: cargo fetch --locked
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Script syntax
+        run: bash -n scripts/*.sh
+
+      - name: Check
+        run: cargo check --locked --workspace
+
+      - name: Test
+        run: cargo test --locked --workspace
+
+      - name: Test RocksDB feature
+        run: cargo test --locked --workspace --features rocksdb
+
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets --features rocksdb -- -D warnings

@@ -5,7 +5,7 @@ use decibel_hotindex_storage::RocksDbEngine;
 use decibel_hotindex_storage::StorageEngine;
 use std::env;
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 fn main() {
@@ -87,8 +87,32 @@ fn write_checksums(path: &Path, checksums: &[CfChecksum]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let file = File::create(path)?;
-    serde_json::to_writer_pretty(BufWriter::new(file), checksums).map_err(json_error)
+    let tmp_path = tmp_path_for(path)?;
+    let file = File::create(&tmp_path)?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, checksums).map_err(json_error)?;
+    writer.flush()?;
+    let file = writer
+        .into_inner()
+        .map_err(|error| HotIndexError::Storage(error.to_string()))?;
+    file.sync_all()?;
+    std::fs::rename(&tmp_path, path)?;
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
+fn tmp_path_for(path: &Path) -> Result<PathBuf> {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err(HotIndexError::Config(format!(
+            "cannot build temp path for {}",
+            path.display()
+        )));
+    };
+    Ok(path.with_file_name(format!("{file_name}.tmp")))
 }
 
 fn read_checksums(path: &Path) -> Result<Vec<CfChecksum>> {
