@@ -37,6 +37,10 @@ impl ToplingDbEngine {
             inner: RocksDbEngine::open(path)?,
         })
     }
+
+    pub fn compact_all(&self) -> Result<()> {
+        self.inner.compact_all()
+    }
 }
 
 impl StorageEngine for ToplingDbEngine {

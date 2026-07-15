@@ -11,8 +11,8 @@ Options:
                            Default: DECIBEL_BIN_DIR, then target/release, then target/debug.
   --raw-input <path>       Raw .pb.zst chunk or raw directory. Default: <dataset-root>/raw
   --skip-normalize         Reuse existing <dataset-root>/normalized and manifest.json
-  --force-normalize        Rebuild normalized tx-only artifacts even if they already exist
-  --force                  Remove existing materialized ToplingDB path before replay
+  --force-normalize        Rebuild normalized artifacts even if they already exist
+  --force                  Replace existing materialized ToplingDB path after staging succeeds
   --network <name>         Dataset network metadata. Default: mainnet
   --dataset-id <id>        Dataset id metadata. Default: dataset root basename
   --parser-commit <sha>    Parser commit metadata
@@ -20,7 +20,7 @@ Options:
   --toplingdb-conf <path>  Sets TOPLINGDB_EASY_MIGRATE_CONF for ToplingDB
 
 Examples:
-  rtk cargo build -p decibel-dataset -p decibel-admin --features toplingsdb --release --target-dir target/topingdb
+  rtk ./scripts/toplingdb-cargo.sh build -p decibel-dataset -p decibel-admin --features toplingsdb --release --target-dir target/topingdb
   rtk ./scripts/import-real-data.sh toplingdb /data/decibel-hotindex/datasets/mainnet-4365621793-4381375638 --bin-dir target/topingdb/release --toplingdb-conf /path/to/topling_sui.yaml
 
 Note:
@@ -61,7 +61,7 @@ default_bin_dir() {
 }
 
 build_hint() {
-  echo "rtk cargo build -p decibel-dataset -p decibel-admin --features toplingsdb --release --target-dir target/topingdb"
+  echo "rtk ./scripts/toplingdb-cargo.sh build -p decibel-dataset -p decibel-admin --features toplingsdb --release --target-dir target/topingdb"
 }
 
 resolve_bin_dir() {
@@ -128,6 +128,18 @@ dataset_id=""
 parser_commit=""
 config_path=""
 toplingdb_conf="${TOPLINGDB_EASY_MIGRATE_CONF:-}"
+active_staging_db_path=""
+active_staging_checksum_path=""
+
+cleanup_staging() {
+  if [[ -n "$active_staging_db_path" ]]; then
+    rm -rf "$active_staging_db_path"
+  fi
+  if [[ -n "$active_staging_checksum_path" ]]; then
+    rm -f "$active_staging_checksum_path"
+  fi
+}
+trap cleanup_staging EXIT
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -230,26 +242,38 @@ normalize_dataset() {
 import_toplingdb() {
   local db_path="$dataset_root/materialized/toplingdb"
   local checksum_path="$dataset_root/reports/toplingdb-checksums.json"
+  local staging_db_path="$dataset_root/materialized/.toplingdb.staging.$$"
+  local staging_checksum_path="$dataset_root/reports/.toplingdb-checksums.json.staging.$$"
+  active_staging_db_path="$staging_db_path"
+  active_staging_checksum_path="$staging_checksum_path"
 
   if [[ -e "$db_path" ]]; then
-    if [[ "$force" -eq 1 ]]; then
-      rm -rf "$db_path"
-    else
+    if [[ "$force" -ne 1 ]]; then
       die "materialized DB path already exists: $db_path (pass --force to rebuild)"
     fi
   fi
 
   mkdir -p "$dataset_root/materialized" "$dataset_root/reports"
+  rm -rf "$staging_db_path"
+  rm -f "$staging_checksum_path"
 
   run_cmd "$dataset_bin" replay \
     --dataset "$dataset_root" \
     --engine toplingdb \
-    --db-path "$db_path"
+    --db-path "$staging_db_path"
 
   run_cmd "$admin_bin" checksum \
     --engine toplingdb \
-    --db-path "$db_path" \
-    --out "$checksum_path"
+    --db-path "$staging_db_path"
+    --out "$staging_checksum_path"
+
+  if [[ -e "$db_path" ]]; then
+    rm -rf "$db_path"
+  fi
+  mv "$staging_db_path" "$db_path"
+  mv "$staging_checksum_path" "$checksum_path"
+  active_staging_db_path=""
+  active_staging_checksum_path=""
 }
 
 normalize_dataset

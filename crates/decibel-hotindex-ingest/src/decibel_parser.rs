@@ -35,6 +35,16 @@ pub struct ParserOutput {
 }
 
 #[derive(Debug, Clone)]
+pub struct DecibelEventInput {
+    pub raw_type: String,
+    pub data: Value,
+    pub version: u64,
+    pub tx_hash: String,
+    pub block_timestamp_us: u64,
+    pub event_idx: u32,
+}
+
+#[derive(Debug, Clone)]
 struct TxMeta {
     version: u64,
     tx_hash: String,
@@ -48,6 +58,24 @@ pub fn parse_fixture_jsonl_file(path: &Path, options: &ParserOptions) -> Result<
 
 pub fn parse_fixture_jsonl_str(input: &str, options: &ParserOptions) -> Result<ParserOutput> {
     parse_fixture_jsonl_reader(BufReader::new(input.as_bytes()), options)
+}
+
+pub fn parse_decibel_event_from_parts(
+    input: DecibelEventInput,
+    options: &ParserOptions,
+    output: &mut ParserOutput,
+) -> Result<()> {
+    let event = serde_json::json!({
+        "event_idx": input.event_idx,
+        "type": input.raw_type,
+        "data": input.data,
+    });
+    let meta = TxMeta {
+        version: input.version,
+        tx_hash: input.tx_hash,
+        block_timestamp_us: input.block_timestamp_us,
+    };
+    parse_event(&event, &meta, input.event_idx, 0, options, output)
 }
 
 fn parse_fixture_jsonl_reader<R: BufRead>(
@@ -521,7 +549,7 @@ mod tests {
         assert!(output.unknown_events[0]
             .payload
             .clone()
-            .as_raw_json()
+            .into_raw_json()
             .contains("kept"));
     }
 
@@ -537,11 +565,11 @@ mod tests {
     }
 
     trait PayloadExt {
-        fn as_raw_json(self) -> String;
+        fn into_raw_json(self) -> String;
     }
 
     impl PayloadExt for decibel_hotindex_core::DecibelEventPayload {
-        fn as_raw_json(self) -> String {
+        fn into_raw_json(self) -> String {
             match self {
                 decibel_hotindex_core::DecibelEventPayload::RawJson { value } => value,
                 _ => String::new(),

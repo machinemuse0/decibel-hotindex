@@ -119,6 +119,34 @@ fn run_storage_conformance<E: StorageEngine>(engine: E) {
     assert_eq!(positions[0].size, "2");
 
     engine
+        .put_position(position_row_with_subaccount(
+            "acct-a",
+            "BTC-PERP",
+            Some("sub-a"),
+            "3",
+        ))
+        .unwrap();
+    engine
+        .put_position(position_row_with_subaccount(
+            "acct-a",
+            "BTC-PERP",
+            Some("sub-b"),
+            "4",
+        ))
+        .unwrap();
+    let positions = engine.get_positions_by_account("acct-a").unwrap();
+    assert_eq!(positions.len(), 3);
+    assert!(positions
+        .iter()
+        .any(|position| position.subaccount.is_none() && position.size == "2"));
+    assert!(positions
+        .iter()
+        .any(|position| position.subaccount.as_deref() == Some("sub-a") && position.size == "3"));
+    assert!(positions
+        .iter()
+        .any(|position| position.subaccount.as_deref() == Some("sub-b") && position.size == "4"));
+
+    engine
         .put_builder_attribution(builder_row("fill-old", 100, "acct-a", "10.50"))
         .unwrap();
     engine
@@ -164,6 +192,11 @@ fn run_storage_conformance<E: StorageEngine>(engine: E) {
     assert!(stats.checkpoint_count >= 1);
 
     let checksums = engine.checksums().unwrap();
+    let cf_names = checksums
+        .iter()
+        .map(|checksum| checksum.cf_name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(cf_names, crate::LOGICAL_CFS);
     assert!(checksums.iter().any(|cf| cf.cf_name == "cf_tx_by_version"));
     assert!(checksums.iter().any(|cf| cf.row_count > 0));
     assert_eq!(checksums, engine.checksums().unwrap());
@@ -262,10 +295,19 @@ fn order_row(order_id: &str, status: &str) -> OrderRow {
 }
 
 fn position_row(account: &str, market_id: &str, size: &str) -> PositionRow {
+    position_row_with_subaccount(account, market_id, None, size)
+}
+
+fn position_row_with_subaccount(
+    account: &str,
+    market_id: &str,
+    subaccount: Option<&str>,
+    size: &str,
+) -> PositionRow {
     PositionRow {
         account: account.to_string(),
         market_id: market_id.to_string(),
-        subaccount: None,
+        subaccount: subaccount.map(str::to_string),
         size: size.to_string(),
         entry_price: Some("100".to_string()),
         source_version: 10,

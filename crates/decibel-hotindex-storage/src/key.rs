@@ -80,9 +80,18 @@ pub fn order_by_id(order_id: &str) -> Vec<u8> {
     order_id.as_bytes().to_vec()
 }
 
-pub fn positions_by_account_market(account: &str, market_id: &str) -> Vec<u8> {
-    assert_text_segments(&[account, market_id]);
-    join_segments(&[account.as_bytes(), market_id.as_bytes()])
+pub fn positions_by_account_market(
+    account: &str,
+    market_id: &str,
+    subaccount: Option<&str>,
+) -> Vec<u8> {
+    let subaccount = optional_text_segment(subaccount);
+    assert_text_segments(&[account, market_id, &subaccount]);
+    join_segments(&[
+        account.as_bytes(),
+        market_id.as_bytes(),
+        subaccount.as_bytes(),
+    ])
 }
 
 pub fn positions_by_account_prefix(account: &str) -> Vec<u8> {
@@ -157,16 +166,25 @@ fn prefix_segments(segments: &[&[u8]]) -> Vec<u8> {
 
 fn assert_text_segments(segments: &[&str]) {
     for segment in segments {
-        debug_assert!(
+        assert!(
             !segment.as_bytes().contains(&SEP),
             "text key segment contains the reserved 0x00 separator"
         );
     }
 }
 
+fn optional_text_segment(value: Option<&str>) -> String {
+    match value {
+        Some(value) => format!("some:{value}"),
+        None => "none".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{be_u64, fills_by_market_time, raw_event_by_version_idx};
+    use super::{
+        be_u64, fills_by_market_time, positions_by_account_market, raw_event_by_version_idx,
+    };
 
     #[test]
     fn big_endian_orders_numeric_values() {
@@ -185,5 +203,20 @@ mod tests {
         let newer = fills_by_market_time("BTC-PERP", 200, 1, "fill-b");
         let older = fills_by_market_time("BTC-PERP", 100, 1, "fill-a");
         assert!(newer < older);
+    }
+
+    #[test]
+    fn position_key_distinguishes_subaccounts() {
+        let default = positions_by_account_market("acct-a", "BTC-PERP", None);
+        let sub_a = positions_by_account_market("acct-a", "BTC-PERP", Some("sub-a"));
+        let sub_b = positions_by_account_market("acct-a", "BTC-PERP", Some("sub-b"));
+        assert_ne!(default, sub_a);
+        assert_ne!(sub_a, sub_b);
+    }
+
+    #[test]
+    #[should_panic(expected = "reserved 0x00 separator")]
+    fn text_key_segments_reject_reserved_separator() {
+        fills_by_market_time("BTC\0PERP", 200, 1, "fill-a");
     }
 }

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if command -v llvm-objcopy >/dev/null 2>&1; then
+  exec llvm-objcopy "$@"
+fi
+
+for candidate in \
+  /opt/homebrew/opt/llvm/bin/llvm-objcopy \
+  /opt/homebrew/bin/llvm-objcopy \
+  /usr/local/opt/llvm/bin/llvm-objcopy \
+  /usr/local/bin/llvm-objcopy; do
+  if [[ -x "$candidate" ]]; then
+    exec "$candidate" "$@"
+  fi
+done
+
+# libbase64 uses objcopy only to trim exported symbols from a relocatable
+# object. If LLVM is unavailable on Darwin, keep the untrimmed object so the
+# native preflight can still validate the ToplingDB link path.
+exit 0

@@ -14,6 +14,11 @@ Usage:
     [--workloads <csv>] \
     [--iterations <count>] \
     [--warmup <count>] \
+    [--concurrency <workers>] \
+    [--rate <qps>] \
+    [--compact-before-run] \
+    [--cache-state <unspecified|warm|cold-cleared>] \
+    [--cache-clear-command <command>] \
     [--access-pattern <sequential|uniform|zipfian>] \
     [--seed <value>] \
     [--db-path <path>] \
@@ -24,6 +29,7 @@ Usage:
     [--expected-checksum <auto|none|path>] \
     [--checksum-status <status>] \
     [--toplingdb-conf <path>] \
+    [--allow-failures] \
     [--no-summary] \
     [--dry-run]
 
@@ -38,6 +44,10 @@ Defaults:
   - workload: get_tx_by_version
   - iterations: 100000
   - warmup: 1000
+  - concurrency: 1
+  - rate: 1000 qps for serving/read-under-ingest open-loop scheduling
+  - compaction: requested by default for ToplingDB LSM compaction before measurement
+  - cache state: warm
   - access pattern: zipfian
   - report dir: <dataset-root>/reports
   - summary out: <report-dir>/BENCHMARK_SUMMARY.md
@@ -51,7 +61,7 @@ Examples:
     --toplingdb-conf "$TOPLINGDB_EASY_MIGRATE_CONF"
 
 Build hint:
-  rtk cargo build -p decibel-hotindex-bench --features toplingsdb --release --target-dir target/topingdb
+  rtk ./scripts/toplingdb-cargo.sh build -p decibel-hotindex-bench --features toplingsdb --release --target-dir target/topingdb
 
 Note:
   RocksDB benchmark runs must be launched from the clean main worktree. This
@@ -88,6 +98,11 @@ BENCH_CLASS="serving"
 WORKLOADS="get_tx_by_version"
 ITERATIONS="100000"
 WARMUP="1000"
+CONCURRENCY="1"
+RATE_QPS="1000"
+COMPACT_BEFORE_RUN=0
+CACHE_STATE="warm"
+CACHE_CLEAR_COMMAND=""
 ACCESS_PATTERN="zipfian"
 SEED="6840346605343600653"
 DB_PATH=""
@@ -98,6 +113,7 @@ SUMMARY_OUT=""
 EXPECTED_CHECKSUM="auto"
 CHECKSUM_STATUS="not_run"
 TOPLINGDB_CONF="${TOPLINGDB_EASY_MIGRATE_CONF:-}"
+ALLOW_FAILURES=0
 NO_SUMMARY=0
 DRY_RUN=0
 
@@ -144,6 +160,26 @@ while [[ $# -gt 0 ]]; do
       WARMUP="${2:-}"
       shift 2
       ;;
+    --concurrency)
+      CONCURRENCY="${2:-}"
+      shift 2
+      ;;
+    --rate)
+      RATE_QPS="${2:-}"
+      shift 2
+      ;;
+    --compact-before-run)
+      COMPACT_BEFORE_RUN=1
+      shift
+      ;;
+    --cache-state)
+      CACHE_STATE="${2:-}"
+      shift 2
+      ;;
+    --cache-clear-command)
+      CACHE_CLEAR_COMMAND="${2:-}"
+      shift 2
+      ;;
     --access-pattern)
       ACCESS_PATTERN="${2:-}"
       shift 2
@@ -184,6 +220,10 @@ while [[ $# -gt 0 ]]; do
       TOPLINGDB_CONF="${2:-}"
       shift 2
       ;;
+    --allow-failures)
+      ALLOW_FAILURES=1
+      shift
+      ;;
     --no-summary)
       NO_SUMMARY=1
       shift
@@ -220,6 +260,10 @@ case "$BACKEND" in
     ;;
   *) die "--backend must be memory or toplingdb" ;;
 esac
+
+if [[ "$BACKEND" != "memory" ]]; then
+  COMPACT_BEFORE_RUN=1
+fi
 
 case "$BENCH_CLASS" in
   serving | ingest | read-under-ingest | read_under_ingest) ;;
@@ -357,12 +401,24 @@ run_one_benchmark() {
     --class "$BENCH_CLASS"
     --iterations "$ITERATIONS"
     --warmup "$WARMUP"
+    --concurrency "$CONCURRENCY"
+    --cache-state "$CACHE_STATE"
     --out "$report_path"
   )
 
   if [[ "$BENCH_CLASS" == "serving" || "$BENCH_CLASS" == "read-under-ingest" || "$BENCH_CLASS" == "read_under_ingest" ]]; then
     args+=(--workload "$workload")
     args+=(--access-pattern "$ACCESS_PATTERN" --seed "$SEED")
+    if [[ -n "$RATE_QPS" ]]; then
+      args+=(--rate "$RATE_QPS")
+    fi
+  fi
+
+  if [[ "$COMPACT_BEFORE_RUN" -eq 1 ]]; then
+    args+=(--compact-before-run)
+  fi
+  if [[ -n "$CACHE_CLEAR_COMMAND" ]]; then
+    args+=(--cache-clear-command "$CACHE_CLEAR_COMMAND")
   fi
 
   local db_path
@@ -380,6 +436,10 @@ run_one_benchmark() {
     args+=(--expected-checksum "$expected_checksum_path")
   else
     args+=(--checksum-status "$CHECKSUM_STATUS")
+  fi
+
+  if [[ "$ALLOW_FAILURES" -eq 1 ]]; then
+    args+=(--allow-failures)
   fi
 
   echo "benchmark: backend=$BACKEND class=$BENCH_CLASS workload=$workload report=$report_path"

@@ -13,10 +13,11 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.76"
+rust-version = "1.85"
 license = "Apache-2.0"
 
 [workspace.dependencies]
+aptos-protos = { git = "https://github.com/aptos-labs/aptos-core.git", rev = "d181eb37ea0681d5248cd9aa7a536dd3787f03e8" }
 decibel-hotindex-core = { path = "crates/decibel-hotindex-core" }
 decibel-hotindex-ingest = { path = "crates/decibel-hotindex-ingest" }
 decibel-hotindex-storage = { path = "crates/decibel-hotindex-storage", default-features = false }
@@ -26,6 +27,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 sha2 = "0.10"
+hdrhistogram = "7"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 tonic = { version = "0.12.3", features = [
     "tls",
